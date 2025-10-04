@@ -90,39 +90,6 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
     return ok;
   }
 
-  Widget _buildManualTab(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.all(16),
-      child: Column(
-        children: [
-          TextField(
-            controller: _codeController,
-            decoration: const InputDecoration(labelText: 'Employee Code'),
-          ),
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              ElevatedButton(
-                onPressed: () => _handleSubmit(
-                  _codeController.text.trim(),
-                  AttendanceType.inScan,
-                ),
-                child: const Text('Mark IN'),
-              ),
-              const SizedBox(width: 12),
-              ElevatedButton(
-                onPressed: () => _handleSubmit(
-                  _codeController.text.trim(),
-                  AttendanceType.outScan,
-                ),
-                child: const Text('Mark OUT'),
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
 
   Widget _buildQrTab(BuildContext context) {
     return MobileScanner(
