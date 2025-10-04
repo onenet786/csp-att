@@ -2,7 +2,7 @@ import 'dart:async';
 import 'package:employee_attendance/models/attendance_record.dart';
 import 'package:employee_attendance/providers/attendance_provider.dart';
 import 'package:flutter/material.dart';
-import 'package:local_auth/local_auth.dart';
+// local_auth removed due to unused thumb scan
 // mobile_scanner removed due to unused QR tab
 import 'package:provider/provider.dart';
 
