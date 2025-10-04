@@ -12,6 +12,9 @@ class AttendanceProvider extends ChangeNotifier {
   Employee? currentEmployee;
   bool isSubmitting = false;
   String? errorMessage;
+  int? lastStatusCode;
+  DateTime? todayCheckInTime;
+  DateTime? todayCheckOutTime;
 
   Future<void> loadEmployee(String code) async {
     errorMessage = null;
@@ -21,18 +24,30 @@ class AttendanceProvider extends ChangeNotifier {
       // Swallow errors; marking can proceed with code only
       currentEmployee = currentEmployee; // no-op to satisfy lints
     }
+    try {
+      final times = await api.fetchEmployeeAttendanceTimes(code);
+      final inStr = (times['today']?['inTime'])?.toString();
+      final outStr = (times['today']?['outTime'])?.toString();
+      todayCheckInTime = (inStr != null && inStr.isNotEmpty) ? DateTime.tryParse(inStr) : null;
+      todayCheckOutTime = (outStr != null && outStr.isNotEmpty) ? DateTime.tryParse(outStr) : null;
+    } catch (_) {
+      todayCheckInTime = null;
+      todayCheckOutTime = null;
+    }
     notifyListeners();
   }
 
   Future<bool> submitAttendance(AttendanceRecord record) async {
     isSubmitting = true;
     errorMessage = null;
+    lastStatusCode = null;
     notifyListeners();
     try {
       await api.markAttendance(record);
       return true;
     } catch (e) {
       if (e is ApiException) {
+        lastStatusCode = e.statusCode;
         // Prefer backend-provided error message, with status code context
         final backendMsg = e.body?['error']?.toString() ?? e.body?['message']?.toString();
         errorMessage = backendMsg != null

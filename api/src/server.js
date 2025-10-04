@@ -107,6 +107,15 @@ app.get("/db/sample", async (req, res) => {
 app.get("/employees/:code", async (req, res) => {
   try {
     const pool = await getPool();
+    // Check if Employees table exists
+    const exists = await pool
+      .request()
+      .input("t", sql.NVarChar(128), "Employees")
+      .query("SELECT 1 AS ok FROM sys.tables WHERE name = @t");
+    if (!exists.recordset?.[0]?.ok) {
+      // Gracefully return null if Employees table isn't present
+      return res.json({ employee: null });
+    }
     const result = await pool
       .request()
       .input("code", sql.VarChar(50), req.params.code)
@@ -117,6 +126,181 @@ app.get("/employees/:code", async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Failed to fetch employee" });
+  }
+});
+
+// GET /employees/:code/attendance-times
+// Returns employee details along with today's first check-in and last check-out times.
+app.get("/employees/:code/attendance-times", async (req, res) => {
+  const code = req.params.code;
+  if (!code) return res.status(400).json({ error: "Missing employee code" });
+  try {
+    const pool = await getPool();
+
+    // Fetch employee info (if available)
+    let employee = null;
+    try {
+      const empRes = await pool
+        .request()
+        .input("code", sql.VarChar(50), code)
+        .query(
+          "SELECT TOP 1 Code as code, Name as name, Designation as designation, Department as department, PhotoUrl as imageUrl FROM Employees WHERE Code = @code"
+        );
+      employee = empRes.recordset?.[0] || null;
+    } catch (_) {
+      employee = null;
+    }
+
+    // Detect attendance schema
+    const attendanceColumns = await getAttendanceColumns(pool);
+    let schema = attendanceColumns.length ? "attendance" : "legacy";
+
+    let inTime = null;
+    let outTime = null;
+
+    if (!attendanceColumns.length) {
+      // Legacy Attendance(EmployeeCode, TimeStamp, Reason, Type)
+      const rIn = await pool
+        .request()
+        .input("employeeCode", sql.VarChar(50), code)
+        .query(
+          "SELECT TOP 1 TimeStamp AS ts FROM Attendance WHERE EmployeeCode = @employeeCode AND LOWER(Type) = 'in' AND CAST(TimeStamp AS date) = CAST(GETDATE() AS date) ORDER BY TimeStamp ASC"
+        );
+      const rOut = await pool
+        .request()
+        .input("employeeCode", sql.VarChar(50), code)
+        .query(
+          "SELECT TOP 1 TimeStamp AS ts FROM Attendance WHERE EmployeeCode = @employeeCode AND LOWER(Type) = 'out' AND CAST(TimeStamp AS date) = CAST(GETDATE() AS date) ORDER BY TimeStamp DESC"
+        );
+      inTime = rIn.recordset?.[0]?.ts ? new Date(rIn.recordset[0].ts).toISOString() : null;
+      outTime = rOut.recordset?.[0]?.ts ? new Date(rOut.recordset[0].ts).toISOString() : null;
+      return res.json({ employee, today: { inTime, outTime }, schema });
+    }
+
+    // Current attendance schema
+    // Resolve employee_id (Code in Employees or parse numeric code)
+    let employeeId;
+    try {
+      const empResult = await pool
+        .request()
+        .input("code", sql.VarChar(50), code)
+        .query("SELECT TOP 1 Id AS id FROM Employees WHERE Code = @code");
+      employeeId = empResult.recordset?.[0]?.id;
+    } catch (_) {
+      employeeId = undefined;
+    }
+    if (!employeeId) {
+      const parsed = Number(code);
+      if (Number.isFinite(parsed)) employeeId = parsed;
+    }
+    if (!employeeId) {
+      return res.status(404).json({ error: "Employee not found for code", code });
+    }
+
+    const info = await getTableSchemaAndName(pool, "attendance");
+    const fullName = `${quoteIdent(info.schema)}.${quoteIdent(info.name)}`;
+    const dateCol = attendanceColumns.find((c) => ["datetime", "datetime2", "smalldatetime", "date"].includes(String(c.type).toLowerCase()));
+
+    if (!dateCol) {
+      // No date/time column; cannot compute today's times reliably
+      return res.json({ employee, today: { inTime: null, outTime: null }, schema, employee_id: employeeId });
+    }
+
+    const qIn = `SELECT MIN(${quoteIdent(dateCol.column)}) AS inTime FROM ${fullName} WHERE ${quoteIdent("employee_id")} = @employee_id AND ${quoteIdent("attendance_type")} = 'In' AND CAST(${quoteIdent(dateCol.column)} AS date) = CAST(GETDATE() AS date)`;
+    const qOut = `SELECT MAX(${quoteIdent(dateCol.column)}) AS outTime FROM ${fullName} WHERE ${quoteIdent("employee_id")} = @employee_id AND ${quoteIdent("attendance_type")} = 'Out' AND CAST(${quoteIdent(dateCol.column)} AS date) = CAST(GETDATE() AS date)`;
+    const rIn = await pool.request().input("employee_id", sql.Int, employeeId).query(qIn);
+    const rOut = await pool.request().input("employee_id", sql.Int, employeeId).query(qOut);
+    inTime = rIn.recordset?.[0]?.inTime ? new Date(rIn.recordset[0].inTime).toISOString() : null;
+    outTime = rOut.recordset?.[0]?.outTime ? new Date(rOut.recordset[0].outTime).toISOString() : null;
+    return res.json({ employee, today: { inTime, outTime }, schema, employee_id: employeeId });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Failed to get employee attendance times", details: e.message });
+  }
+});
+
+// GET /attendance/status/:code
+// Returns current status (IN/OUT) based on latest record for today (if possible),
+// including latest reason and timestamp. Supports legacy `Attendance` and
+// current `attendance` table schemas.
+app.get("/attendance/status/:code", async (req, res) => {
+  const code = req.params.code;
+  if (!code) return res.status(400).json({ error: "Missing employee code" });
+  try {
+    const pool = await getPool();
+    const attendanceColumns = await getAttendanceColumns(pool);
+    let status = "OUT";
+    let latestReason = null;
+    let latestTimestamp = null;
+
+    // Legacy schema: Attendance(EmployeeCode, TimeStamp, Reason, Type)
+    if (!attendanceColumns.length) {
+      const rToday = await pool
+        .request()
+        .input("employeeCode", sql.VarChar(50), code)
+        .query(
+          "SELECT TOP 1 Type AS type, Reason AS reason, TimeStamp AS ts FROM Attendance WHERE EmployeeCode = @employeeCode AND CAST(TimeStamp AS date) = CAST(GETDATE() AS date) ORDER BY TimeStamp DESC"
+        );
+      let row = rToday.recordset?.[0];
+      if (!row) {
+        const rAny = await pool
+          .request()
+          .input("employeeCode", sql.VarChar(50), code)
+          .query(
+            "SELECT TOP 1 Type AS type, Reason AS reason, TimeStamp AS ts FROM Attendance WHERE EmployeeCode = @employeeCode ORDER BY TimeStamp DESC"
+          );
+        row = rAny.recordset?.[0];
+      }
+      if (row) {
+        const t = String(row.type || "").trim().toLowerCase();
+        status = t === "in" ? "IN" : "OUT";
+        latestReason = row.reason || null;
+        latestTimestamp = row.ts ? new Date(row.ts).toISOString() : null;
+      }
+      return res.json({ status, reason: latestReason, timestamp: latestTimestamp, schema: "legacy" });
+    }
+
+    // Current schema: attendance(employee_id, attendance_reason, attendance_type, attendance_seqno, ...)
+    // Resolve employee_id based on employeeCode
+    let employeeId;
+    try {
+      const empResult = await pool
+        .request()
+        .input("code", sql.VarChar(50), code)
+        .query("SELECT TOP 1 Id AS id FROM Employees WHERE Code = @code");
+      employeeId = empResult.recordset?.[0]?.id;
+    } catch (_) {
+      employeeId = undefined;
+    }
+    if (!employeeId) {
+      const parsed = Number(code);
+      if (Number.isFinite(parsed)) employeeId = parsed;
+    }
+    if (!employeeId) {
+      return res.status(404).json({ error: "Employee not found for code", code });
+    }
+
+    const info = await getTableSchemaAndName(pool, "attendance");
+    const fullName = `${quoteIdent(info.schema)}.${quoteIdent(info.name)}`;
+    const dateCol = attendanceColumns.find((c) => ["datetime", "datetime2", "smalldatetime", "date"].includes(String(c.type).toLowerCase()));
+    let qLatest;
+    if (dateCol) {
+      qLatest = `SELECT TOP 1 ${quoteIdent("attendance_type")} AS type, ${quoteIdent("attendance_reason")} AS reason, ${quoteIdent(dateCol.column)} AS ts FROM ${fullName} WHERE ${quoteIdent("employee_id")} = @employee_id AND CAST(${quoteIdent(dateCol.column)} AS date) = CAST(GETDATE() AS date) ORDER BY ${quoteIdent("attendance_seqno")} DESC`;
+    } else {
+      qLatest = `SELECT TOP 1 ${quoteIdent("attendance_type")} AS type, ${quoteIdent("attendance_reason")} AS reason FROM ${fullName} WHERE ${quoteIdent("employee_id")} = @employee_id ORDER BY ${quoteIdent("attendance_seqno")} DESC`;
+    }
+    const rLatest = await pool.request().input("employee_id", sql.Int, employeeId).query(qLatest);
+    const row = rLatest.recordset?.[0];
+    if (row) {
+      const t = String(row.type || "").trim().toLowerCase();
+      status = t === "in" ? "IN" : "OUT";
+      latestReason = row.reason || null;
+      latestTimestamp = row.ts ? new Date(row.ts).toISOString() : null;
+    }
+    return res.json({ status, reason: latestReason, timestamp: latestTimestamp, schema: "attendance", employee_id: employeeId });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Failed to get status", details: e.message });
   }
 });
 
@@ -135,6 +319,14 @@ app.post("/attendance/mark", async (req, res) => {
     // Normalize type from UI enum (inScan/outScan) to 'In'/'Out'
     const normalizedType = String(type).toLowerCase();
     const attendanceType = normalizedType.includes("out") ? "Out" : "In";
+
+    // Require a reason on checkout (Out)
+    if (attendanceType === "Out") {
+      const trimmedReason = String(reason || "").trim();
+      if (!trimmedReason) {
+        return res.status(400).json({ error: "Checkout requires a reason" });
+      }
+    }
 
     // Resolve employee_id based on employeeCode
     let employeeId;
@@ -161,6 +353,31 @@ app.post("/attendance/mark", async (req, res) => {
     // Check if the lowercase `attendance` table exists; if not, fall back to legacy insert
     const attendanceColumns = await getAttendanceColumns(pool);
     if (!attendanceColumns.length) {
+      // Rule: prevent multiple check-ins: if latest record today is In, disallow another In
+      if (attendanceType === "In") {
+        const latestToday = await pool
+          .request()
+          .input("employeeCode", sql.VarChar(50), employeeCode)
+          .query(
+            "SELECT TOP 1 Type AS type FROM Attendance WHERE EmployeeCode = @employeeCode AND CAST(TimeStamp AS date) = CAST(GETDATE() AS date) ORDER BY TimeStamp DESC"
+          );
+        const latestType = String(latestToday.recordset?.[0]?.type || "").trim().toLowerCase();
+        if (latestType === "in") {
+          return res.status(409).json({ error: "Already checked-in; please check-out before checking-in again" });
+        }
+      }
+      // Rule: block re-check-in after Duty Off on same day (legacy schema)
+      if (attendanceType === "In") {
+        const dutyOffToday = await pool
+          .request()
+          .input("employeeCode", sql.VarChar(50), employeeCode)
+          .query(
+            "SELECT TOP 1 1 AS ok FROM Attendance WHERE EmployeeCode = @employeeCode AND LOWER(Reason) = 'duty off' AND CAST(TimeStamp AS date) = CAST(GETDATE() AS date)"
+          );
+        if (dutyOffToday.recordset?.[0]?.ok) {
+          return res.status(409).json({ error: "Cannot check-in again after Duty Off on the same day" });
+        }
+      }
       // Legacy/alternate schema: insert into "Attendance" table with code-based columns
       await pool
         .request()
@@ -182,6 +399,45 @@ app.post("/attendance/mark", async (req, res) => {
         "SELECT ISNULL(MAX(attendance_seqno), 0) + 1 AS nextSeq FROM attendance WHERE employee_id = @employee_id"
       );
     const nextSeq = seqResult.recordset?.[0]?.nextSeq ?? 1;
+
+    // Rule: block re-check-in after Duty Off on same day (attendance schema)
+    if (attendanceType === "In") {
+      const info = await getTableSchemaAndName(pool, "attendance");
+      const fullName = `${quoteIdent(info.schema)}.${quoteIdent(info.name)}`;
+      // Try to detect a timestamp/date column
+      const dateCol = attendanceColumns.find((c) => ["datetime", "datetime2", "smalldatetime", "date"].includes(String(c.type).toLowerCase()));
+      // Rule: prevent multiple check-ins: if latest record is In for today (or overall without date), disallow
+      if (dateCol) {
+        const qLatest = `SELECT TOP 1 ${quoteIdent("attendance_type")} AS type FROM ${fullName} WHERE ${quoteIdent("employee_id")} = @employee_id AND CAST(${quoteIdent(dateCol.column)} AS date) = CAST(GETDATE() AS date) ORDER BY ${quoteIdent("attendance_seqno")} DESC`;
+        const rLatest = await pool.request().input("employee_id", sql.Int, employeeId).query(qLatest);
+        const latestType = (rLatest.recordset?.[0]?.type || "").trim();
+        if (latestType === "In") {
+          return res.status(409).json({ error: "Already checked-in; please check-out before checking-in again" });
+        }
+      } else {
+        const qLatest = `SELECT TOP 1 ${quoteIdent("attendance_type")} AS type FROM ${fullName} WHERE ${quoteIdent("employee_id")} = @employee_id ORDER BY ${quoteIdent("attendance_seqno")} DESC`;
+        const rLatest = await pool.request().input("employee_id", sql.Int, employeeId).query(qLatest);
+        const latestType = String(rLatest.recordset?.[0]?.type || "").trim().toLowerCase();
+        if (latestType === "in") {
+          return res.status(409).json({ error: "Already checked-in; please check-out before checking-in again" });
+        }
+      }
+      if (dateCol) {
+        const q = `SELECT TOP 1 1 AS ok FROM ${fullName} WHERE ${quoteIdent("employee_id")} = @employee_id AND LOWER(${quoteIdent("attendance_reason")}) = 'duty off' AND CAST(${quoteIdent(dateCol.column)} AS date) = CAST(GETDATE() AS date)`;
+        const r = await pool.request().input("employee_id", sql.Int, employeeId).query(q);
+        if (r.recordset?.[0]?.ok) {
+          return res.status(409).json({ error: "Cannot check-in again after Duty Off on the same day" });
+        }
+      } else {
+        // Fallback: check latest record reason regardless of day
+        const q = `SELECT TOP 1 attendance_reason FROM ${fullName} WHERE ${quoteIdent("employee_id")} = @employee_id ORDER BY ${quoteIdent("attendance_seqno")} DESC`;
+        const r = await pool.request().input("employee_id", sql.Int, employeeId).query(q);
+        const lastReason = r.recordset?.[0]?.attendance_reason;
+        if (String(lastReason || '').trim().toLowerCase() === 'duty off') {
+          return res.status(409).json({ error: "Cannot check-in again after Duty Off (no date column)" });
+        }
+      }
+    }
 
     // Build and execute parameterized insert into `attendance`
     const info = await getTableSchemaAndName(pool, "attendance");

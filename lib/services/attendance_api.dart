@@ -20,5 +20,13 @@ class AttendanceApi {
   Future<Map<String, dynamic>> markAttendance(AttendanceRecord record) async {
     return _client.postJson('/attendance/mark', record.toJson());
   }
+
+  Future<Map<String, dynamic>> fetchStatusByCode(String code) async {
+    return _client.getJson('/attendance/status/$code');
+  }
+
+  Future<Map<String, dynamic>> fetchEmployeeAttendanceTimes(String code) async {
+    return _client.getJson('/employees/$code/attendance-times');
+  }
 }
 

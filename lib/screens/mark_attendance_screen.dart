@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:employee_attendance/models/attendance_record.dart';
 import 'package:employee_attendance/providers/attendance_provider.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 // local_auth removed due to unused thumb scan
 // mobile_scanner removed due to unused QR tab
 import 'package:provider/provider.dart';
@@ -20,16 +21,19 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
     vsync: this,
   );
   final TextEditingController _codeController = TextEditingController();
+  final FocusNode _hotkeyFocus = FocusNode(debugLabel: 'hotkey_focus');
   // LocalAuthentication removed due to unused thumb scan
   final List<AttendanceRecord> _recentMarks = <AttendanceRecord>[];
   Timer? _clockTimer;
   DateTime _now = DateTime.now();
   AttendanceType? _lastType;
+  String? _selectedReason;
 
   @override
   void dispose() {
     _tabController.dispose();
     _codeController.dispose();
+    _hotkeyFocus.dispose();
     _clockTimer?.cancel();
     super.dispose();
   }
@@ -43,12 +47,19 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
         _now = DateTime.now();
       });
     });
+    // Ensure keyboard listener receives focus
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _hotkeyFocus.requestFocus();
+      }
+    });
   }
 
   Future<bool> _handleSubmit(
     String code,
-    AttendanceType type,
-  ) async {
+    AttendanceType type, {
+    String? reason,
+  }) async {
     final provider = context.read<AttendanceProvider>();
     await provider.loadEmployee(code);
     // Proceed even if employee not found; backend will map numeric codes
@@ -61,10 +72,33 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
         ),
       );
     }
+    final trimmedCode = code.trim();
+    if (trimmedCode.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Please enter employee code')),
+        );
+      }
+      return false;
+    }
+
+    // Reason handling: require for checkout (Out)
+    final providedReason = (reason ?? (type == AttendanceType.outScan ? '' : 'Duty')).trim();
+    setState(() {
+      _selectedReason = providedReason.isEmpty ? null : providedReason;
+    });
+    if (type == AttendanceType.outScan && providedReason.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Checkout requires reason. Use hotkeys 1..9,0,+,-')),
+        );
+      }
+      return false;
+    }
     final record = AttendanceRecord(
-      employeeCode: code,
+      employeeCode: trimmedCode,
       timestamp: DateTime.now(),
-      reason: 'Duty',
+      reason: providedReason,
       type: type,
     );
     final ok = await provider.submitAttendance(record);
@@ -77,17 +111,170 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
           _recentMarks.removeLast();
         }
       });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Attendance marked')),
+      );
+      return true;
     }
+
+    // If check-in failed for any reason, prompt for checkout reason automatically
+    if (type == AttendanceType.inScan) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(provider.errorMessage == null
+            ? 'Check-In failed. Select a reason to check-out'
+            : '${provider.errorMessage}. Select a reason to check-out')),
+      );
+      final picked = await _showReasonPicker();
+      if (picked != null && picked.trim().isNotEmpty) {
+        final chosen = picked.trim();
+        setState(() {
+          _selectedReason = chosen;
+        });
+        // Submit checkout with selected reason
+        return _handleSubmit(trimmedCode, AttendanceType.outScan, reason: chosen);
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Checkout requires reason. Use hotkeys 1..9,0,+,-')),
+        );
+        return false;
+      }
+    }
+
+    // Default failure path
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text(
-          ok
-              ? 'Attendance marked'
-              : provider.errorMessage ?? 'Failed to mark attendance',
-        ),
+        content: Text(provider.errorMessage ?? 'Failed to mark attendance'),
       ),
     );
-    return ok;
+    return false;
+  }
+
+  Future<void> _loadInfo(String code) async {
+    final trimmed = code.trim();
+    if (trimmed.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Please enter employee code to load info')),
+        );
+      }
+      return;
+    }
+    final provider = context.read<AttendanceProvider>();
+    await provider.loadEmployee(trimmed);
+    if (!mounted) return;
+    final found = provider.currentEmployee != null;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(found ? 'Employee info loaded' : 'No employee details found')),
+    );
+
+    // After loading info, check current status and auto-show reason picker if already IN
+    try {
+      final api = provider.api;
+      final status = await api.fetchStatusByCode(trimmed);
+      final isIn = (status['status']?.toString().toUpperCase() == 'IN');
+      if (isIn) {
+        final picked = await _showReasonPicker();
+        if (picked != null && picked.trim().isNotEmpty) {
+          final reason = picked.trim();
+          setState(() {
+            _selectedReason = reason;
+          });
+          await _handleSubmit(trimmed, AttendanceType.outScan, reason: reason);
+        } else {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Checkout requires reason. Use hotkeys 1..9,0,+,-')),
+          );
+        }
+      }
+    } catch (_) {
+      // Ignore status errors; continue normal flow
+    }
+  }
+
+  Future<String?> _showReasonPicker() async {
+    const reasons = [
+      'Personal',
+      'Tea',
+      'Official Work',
+      'Lunch',
+      'Prayer',
+      'Duty Off',
+      'Other',
+      'Short Leave',
+      'Smoking',
+      'Iftar',
+      'Dinner',
+      'Rest',
+    ];
+    return showDialog<String>(
+      context: context,
+      builder: (ctx) {
+        return SimpleDialog(
+          title: const Text('Select checkout reason'),
+          children: [
+            for (final r in reasons)
+              SimpleDialogOption(
+                onPressed: () => Navigator.of(ctx).pop(r),
+                child: Text(r),
+              ),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              child: Text(
+                'Tip: You can also use keyboard hotkeys 1..9, 0, +, -',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  String? _reasonFromKey(RawKeyEvent e) {
+    if (e is! RawKeyDownEvent) return null;
+    final ch = e.character;
+    const map = {
+      '1': 'Personal',
+      '2': 'Tea',
+      '3': 'Official Work',
+      '4': 'Lunch',
+      '5': 'Prayer',
+      '6': 'Duty Off',
+      '7': 'Other',
+      '8': 'Short Leave',
+      '9': 'Smoking',
+      '+': 'Iftar',
+      '0': 'Dinner',
+      '-': 'Rest',
+    };
+    if (ch != null && map.containsKey(ch)) {
+      return map[ch];
+    }
+    final key = e.logicalKey;
+    if (key == LogicalKeyboardKey.numpadAdd || key == LogicalKeyboardKey.equal) {
+      return 'Iftar';
+    }
+    if (key == LogicalKeyboardKey.numpadSubtract || key == LogicalKeyboardKey.minus) {
+      return 'Rest';
+    }
+    return null;
+  }
+
+  void _onRawKey(RawKeyEvent e) {
+    final reason = _reasonFromKey(e);
+    if (reason != null) {
+      final code = _codeController.text.trim();
+      if (code.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Enter employee code before checkout')),
+        );
+        return;
+      }
+      setState(() {
+        _selectedReason = reason;
+      });
+      _handleSubmit(code, AttendanceType.outScan, reason: reason);
+    }
   }
 
 
@@ -111,7 +298,11 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
           ),
         ],
       ),
-      body: Stack(
+      body: RawKeyboardListener(
+        focusNode: _hotkeyFocus,
+        autofocus: true,
+        onKey: _onRawKey,
+        child: Stack(
         children: [
           Padding(
             padding: const EdgeInsets.all(12),
@@ -119,8 +310,7 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
               children: [
                 Row(
                   children: [
-                    SizedBox(
-                      width: 340,
+                    Expanded(
                       child: Row(
                         children: [
                           Expanded(
@@ -130,11 +320,15 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
                                 labelText: 'Enter Employee Code',
                                 border: OutlineInputBorder(),
                               ),
-                              onSubmitted: (_) => _handleSubmit(
+                              onSubmitted: (_) => _loadInfo(
                                 _codeController.text.trim(),
-                                AttendanceType.inScan,
                               ),
                             ),
+                          ),
+                          const SizedBox(width: 8),
+                          OutlinedButton(
+                            onPressed: () => _loadInfo(_codeController.text.trim()),
+                            child: const Text('Load Info'),
                           ),
                           const SizedBox(width: 8),
                           ElevatedButton(
@@ -142,7 +336,26 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
                               _codeController.text.trim(),
                               AttendanceType.inScan,
                             ),
-                            child: const Text('Mark'),
+                            child: const Text('Check-In'),
+                          ),
+                          const SizedBox(width: 8),
+                          ElevatedButton(
+                            onPressed: () async {
+                              final code = _codeController.text.trim();
+                              if (code.isEmpty) {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(content: Text('Enter employee code before checkout')),
+                                );
+                                return;
+                              }
+                              final reason = await _showReasonPicker();
+                              if (reason == null || reason.trim().isEmpty) return;
+                              setState(() {
+                                _selectedReason = reason.trim();
+                              });
+                              await _handleSubmit(code, AttendanceType.outScan, reason: reason.trim());
+                            },
+                            child: const Text('Check-Out'),
                           ),
                         ],
                       ),
@@ -171,7 +384,9 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
                             border: Border.all(color: Colors.grey.shade400),
                           ),
                           child: SingleChildScrollView(
-                            child: DataTable(
+                            scrollDirection: Axis.horizontal,
+                            child: SingleChildScrollView(
+                              child: DataTable(
                               columns: const [
                                 DataColumn(label: Text('Time')),
                                 DataColumn(label: Text('Reason')),
@@ -197,19 +412,21 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
                                     ]),
                                   )
                                   .toList(),
+                              ),
                             ),
                           ),
                         ),
                       ),
                       const SizedBox(width: 16),
                       // Right panel
-                      SizedBox(
-                        width: 360,
-                        child: LayoutBuilder(
-                          builder: (context, constraints) => SingleChildScrollView(
+                      Flexible(
+                        flex: 1,
+                        child: ConstrainedBox(
+                          constraints: const BoxConstraints(maxWidth: 380),
+                          child: SingleChildScrollView(
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
+                          children: [
                             _buildDetailRow(
                                 'Employee Code', employee?.code ?? ''),
                             _buildDetailRow(
@@ -219,6 +436,13 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
                             _buildDetailRow('Branch Name', ''),
                             _buildDetailRow(
                                 'Group Name', employee?.department ?? ''),
+                            const SizedBox(height: 8),
+                            _buildDetailRow(
+                                'Today Check-In',
+                                _formatMaybeTime(context, context.watch<AttendanceProvider>().todayCheckInTime)),
+                            _buildDetailRow(
+                                'Today Check-Out',
+                                _formatMaybeTime(context, context.watch<AttendanceProvider>().todayCheckOutTime)),
                             const SizedBox(height: 8),
                             Row(
                               children: [
@@ -252,6 +476,8 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
                                 ),
                               ],
                             ),
+                            const SizedBox(height: 8),
+                            _buildDetailRow('Selected Reason', _selectedReason ?? ''),
                             const SizedBox(height: 16),
                             Text(
                               _formatLongDate(_now),
@@ -293,6 +519,7 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       TabBar(
+                        isScrollable: true,
                         controller: _tabController,
                         labelColor: Theme.of(context).colorScheme.primary,
                         tabs: const [
@@ -320,7 +547,8 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
           if (isLoading) const LinearProgressIndicator(),
         ],
       ),
-    );
+    ),
+  );
   }
 }
 
@@ -402,4 +630,13 @@ String _formatLongDate(DateTime date) {
   final wd = weekdayNames[date.weekday - 1];
   final m = monthNames[date.month - 1];
   return '$wd, $m ${date.day}, ${date.year}';
+}
+
+String _formatMaybeTime(BuildContext context, DateTime? dt) {
+  if (dt == null) return '';
+  try {
+    return TimeOfDay.fromDateTime(dt).format(context);
+  } catch (_) {
+    return dt.toLocal().toIso8601String();
+  }
 }
