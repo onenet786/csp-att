@@ -71,6 +71,58 @@ async function getFirstUserTableWithRows(pool) {
   return res.recordset?.[0]?.name || null;
 }
 
+async function tableHasName(pool, name) {
+  const r = await pool
+    .request()
+    .input("t", sql.NVarChar(128), name)
+    .query("SELECT 1 AS ok FROM sys.tables WHERE name = @t");
+  return !!r.recordset?.[0]?.ok;
+}
+
+async function getEmployeeByCode(pool, code) {
+  if (await tableHasName(pool, "Employees")) {
+    const r1 = await pool
+      .request()
+      .input("code", sql.VarChar(50), code)
+      .query(
+        "SELECT TOP 1 Id as id, employee_code as code, Name as name, Designation as designation, Department as department, PhotoUrl as imageUrl FROM Employees WHERE employee_code = @code"
+      );
+    if (r1.recordset?.[0]) return r1.recordset[0];
+    const r2 = await pool
+      .request()
+      .input("code", sql.VarChar(50), code)
+      .query(
+        "SELECT TOP 1 Id as id, Code as code, Name as name, Designation as designation, Department as department, PhotoUrl as imageUrl FROM Employees WHERE Code = @code"
+      );
+    if (r2.recordset?.[0]) return r2.recordset[0];
+  }
+  if (await tableHasName(pool, "employee")) {
+    const r1 = await pool
+      .request()
+      .input("code", sql.VarChar(50), code)
+      .query(
+        "SELECT TOP 1 employee_id as id, employee_code as code, employee_name as name, NULL as designation, NULL as department, employee_image as imageUrl FROM employee WHERE employee_code = @code"
+      );
+    if (r1.recordset?.[0]) return r1.recordset[0];
+    const r2 = await pool
+      .request()
+      .input("code", sql.VarChar(50), code)
+      .query(
+        "SELECT TOP 1 employee_id as id, employee_bar_code as code, employee_name as name, NULL as designation, NULL as department, employee_image as imageUrl FROM employee WHERE employee_bar_code = @code"
+      );
+    if (r2.recordset?.[0]) return r2.recordset[0];
+  }
+  return null;
+}
+
+async function resolveEmployeeId(pool, code) {
+  const emp = await getEmployeeByCode(pool, code);
+  if (emp?.id != null) return emp.id;
+  const parsed = Number(code);
+  if (Number.isFinite(parsed)) return parsed;
+  return null;
+}
+
 // GET /db/sample?table=TableName -> returns TOP 1 * from the specified or first table
 app.get("/db/sample", async (req, res) => {
   try {
@@ -107,25 +159,69 @@ app.get("/db/sample", async (req, res) => {
 app.get("/employees/:code", async (req, res) => {
   try {
     const pool = await getPool();
-    // Check if Employees table exists
-    const exists = await pool
-      .request()
-      .input("t", sql.NVarChar(128), "Employees")
-      .query("SELECT 1 AS ok FROM sys.tables WHERE name = @t");
-    if (!exists.recordset?.[0]?.ok) {
-      // Gracefully return null if Employees table isn't present
-      return res.json({ employee: null });
+    const employee = await getEmployeeByCode(pool, req.params.code);
+    if (!employee) return res.json({ employee: null });
+    // Prefer existing imageUrl; otherwise, expose our photo endpoint for this employee id
+    let imageUrl = employee.imageUrl || null;
+    if (!imageUrl && employee.id != null) {
+      const port = process.env.PORT || 3010;
+      imageUrl = `http://localhost:${port}/employees/${employee.id}/photo`;
     }
-    const result = await pool
-      .request()
-      .input("code", sql.VarChar(50), req.params.code)
-      .query(
-        "SELECT TOP 1 Code as code, Name as name, Designation as designation, Department as department, PhotoUrl as imageUrl FROM Employees WHERE Code = @code"
-      );
-    res.json({ employee: result.recordset[0] || null });
+    res.json({ employee: { ...employee, imageUrl } });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Failed to fetch employee" });
+  }
+});
+
+// GET /employees/:id/photo
+// Streams the employee image bytes (from `employee.employee_image`) if available,
+// otherwise redirects to `Employees.PhotoUrl` when present.
+app.get("/employees/:id/photo", async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id <= 0) {
+      return res.status(400).json({ error: "Invalid employee id" });
+    }
+    const pool = await getPool();
+
+    // Try varbinary image from `employee` table
+    if (await tableHasName(pool, "employee")) {
+      const r = await pool
+        .request()
+        .input("id", sql.Int, id)
+        .query("SELECT TOP 1 employee_image AS img FROM employee WHERE employee_id = @id");
+      const buf = r.recordset?.[0]?.img;
+      if (buf) {
+        // Detect common image formats by magic numbers
+        let contentType = "application/octet-stream";
+        if (Buffer.isBuffer(buf)) {
+          const b0 = buf[0], b1 = buf[1], b2 = buf[2], b3 = buf[3];
+          if (b0 === 0xff && b1 === 0xd8 && b2 === 0xff) contentType = "image/jpeg";
+          else if (b0 === 0x89 && b1 === 0x50 && b2 === 0x4e && b3 === 0x47) contentType = "image/png";
+          else if (b0 === 0x47 && b1 === 0x49 && b2 === 0x46 && b3 === 0x38) contentType = "image/gif";
+        }
+        res.setHeader("Content-Type", contentType);
+        return res.send(buf);
+      }
+    }
+
+    // Fallback: redirect to PhotoUrl from `Employees` table
+    if (await tableHasName(pool, "Employees")) {
+      const r = await pool
+        .request()
+        .input("id", sql.Int, id)
+        .query("SELECT TOP 1 PhotoUrl AS url FROM Employees WHERE Id = @id");
+      const url = r.recordset?.[0]?.url;
+      if (url) {
+        return res.redirect(url);
+      }
+    }
+
+    return res.status(404).json({ error: "Employee photo not found" });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Failed to fetch employee photo" });
   }
 });
 
@@ -136,20 +232,7 @@ app.get("/employees/:code/attendance-times", async (req, res) => {
   if (!code) return res.status(400).json({ error: "Missing employee code" });
   try {
     const pool = await getPool();
-
-    // Fetch employee info (if available)
-    let employee = null;
-    try {
-      const empRes = await pool
-        .request()
-        .input("code", sql.VarChar(50), code)
-        .query(
-          "SELECT TOP 1 Code as code, Name as name, Designation as designation, Department as department, PhotoUrl as imageUrl FROM Employees WHERE Code = @code"
-        );
-      employee = empRes.recordset?.[0] || null;
-    } catch (_) {
-      employee = null;
-    }
+    const employee = await getEmployeeByCode(pool, code);
 
     // Detect attendance schema
     const attendanceColumns = await getAttendanceColumns(pool);
@@ -174,25 +257,18 @@ app.get("/employees/:code/attendance-times", async (req, res) => {
         );
       inTime = rIn.recordset?.[0]?.ts ? new Date(rIn.recordset[0].ts).toISOString() : null;
       outTime = rOut.recordset?.[0]?.ts ? new Date(rOut.recordset[0].ts).toISOString() : null;
-      return res.json({ employee, today: { inTime, outTime }, schema });
+      // Inject imageUrl fallback for legacy schema
+      let imageUrl = employee?.imageUrl || null;
+      if (!imageUrl && employee?.id != null) {
+        const port = process.env.PORT || 3010;
+        imageUrl = `http://localhost:${port}/employees/${employee.id}/photo`;
+      }
+      return res.json({ employee: employee ? { ...employee, imageUrl } : null, today: { inTime, outTime }, schema });
     }
 
     // Current attendance schema
     // Resolve employee_id (Code in Employees or parse numeric code)
-    let employeeId;
-    try {
-      const empResult = await pool
-        .request()
-        .input("code", sql.VarChar(50), code)
-        .query("SELECT TOP 1 Id AS id FROM Employees WHERE Code = @code");
-      employeeId = empResult.recordset?.[0]?.id;
-    } catch (_) {
-      employeeId = undefined;
-    }
-    if (!employeeId) {
-      const parsed = Number(code);
-      if (Number.isFinite(parsed)) employeeId = parsed;
-    }
+    const employeeId = await resolveEmployeeId(pool, code);
     if (!employeeId) {
       return res.status(404).json({ error: "Employee not found for code", code });
     }
@@ -212,7 +288,13 @@ app.get("/employees/:code/attendance-times", async (req, res) => {
     const rOut = await pool.request().input("employee_id", sql.Int, employeeId).query(qOut);
     inTime = rIn.recordset?.[0]?.inTime ? new Date(rIn.recordset[0].inTime).toISOString() : null;
     outTime = rOut.recordset?.[0]?.outTime ? new Date(rOut.recordset[0].outTime).toISOString() : null;
-    return res.json({ employee, today: { inTime, outTime }, schema, employee_id: employeeId });
+    // Inject imageUrl fallback for attendance schema
+    let imageUrl = employee?.imageUrl || null;
+    if (!imageUrl && employee?.id != null) {
+      const port = process.env.PORT || 3010;
+      imageUrl = `http://localhost:${port}/employees/${employee.id}/photo`;
+    }
+    return res.json({ employee: employee ? { ...employee, imageUrl } : null, today: { inTime, outTime }, schema, employee_id: employeeId });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Failed to get employee attendance times", details: e.message });
@@ -262,20 +344,7 @@ app.get("/attendance/status/:code", async (req, res) => {
 
     // Current schema: attendance(employee_id, attendance_reason, attendance_type, attendance_seqno, ...)
     // Resolve employee_id based on employeeCode
-    let employeeId;
-    try {
-      const empResult = await pool
-        .request()
-        .input("code", sql.VarChar(50), code)
-        .query("SELECT TOP 1 Id AS id FROM Employees WHERE Code = @code");
-      employeeId = empResult.recordset?.[0]?.id;
-    } catch (_) {
-      employeeId = undefined;
-    }
-    if (!employeeId) {
-      const parsed = Number(code);
-      if (Number.isFinite(parsed)) employeeId = parsed;
-    }
+    const employeeId = await resolveEmployeeId(pool, code);
     if (!employeeId) {
       return res.status(404).json({ error: "Employee not found for code", code });
     }
@@ -329,23 +398,7 @@ app.post("/attendance/mark", async (req, res) => {
     }
 
     // Resolve employee_id based on employeeCode
-    let employeeId;
-    try {
-      const empResult = await pool
-        .request()
-        .input("code", sql.VarChar(50), employeeCode)
-        .query("SELECT TOP 1 Id AS id FROM Employees WHERE Code = @code");
-      employeeId = empResult.recordset?.[0]?.id;
-    } catch (lookupErr) {
-      // If Employees table doesn't exist, we'll try to parse employeeCode as ID below
-      employeeId = undefined;
-    }
-    if (!employeeId) {
-      const parsed = Number(employeeCode);
-      if (Number.isFinite(parsed)) {
-        employeeId = parsed;
-      }
-    }
+    const employeeId = await resolveEmployeeId(pool, employeeCode);
     if (!employeeId) {
       return res.status(404).json({ error: "Employee not found for code", code: employeeCode });
     }

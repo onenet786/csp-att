@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:employee_attendance/models/attendance_record.dart';
 import 'package:employee_attendance/providers/attendance_provider.dart';
+import 'package:employee_attendance/screens/employee_details_screen.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 // local_auth removed due to unused thumb scan
@@ -288,6 +289,20 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
       appBar: AppBar(
         title: const Text('Terminal Attendance'),
         actions: [
+          IconButton(
+            tooltip: 'Employee Details',
+            icon: const Icon(Icons.info_outline),
+            onPressed: () {
+              final code = _codeController.text.trim();
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => EmployeeDetailsScreen(
+                    initialCode: code.isEmpty ? null : code,
+                  ),
+                ),
+              );
+            },
+          ),
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16),
             child: Center(
@@ -471,6 +486,7 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
                                       ? Image.network(
                                           employee!.imageUrl!,
                                           fit: BoxFit.cover,
+                                          errorBuilder: (context, error, stack) => const Icon(Icons.person, size: 64),
                                         )
                                       : const Icon(Icons.person, size: 64),
                                 ),
