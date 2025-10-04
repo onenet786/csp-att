@@ -3,7 +3,7 @@ import 'package:employee_attendance/models/attendance_record.dart';
 import 'package:employee_attendance/providers/attendance_provider.dart';
 import 'package:flutter/material.dart';
 import 'package:local_auth/local_auth.dart';
-import 'package:mobile_scanner/mobile_scanner.dart';
+// mobile_scanner removed due to unused QR tab
 import 'package:provider/provider.dart';
 
 class MarkAttendanceScreen extends StatefulWidget {
@@ -20,7 +20,7 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
     vsync: this,
   );
   final TextEditingController _codeController = TextEditingController();
-  final LocalAuthentication _auth = LocalAuthentication();
+  // LocalAuthentication removed due to unused thumb scan
   final List<AttendanceRecord> _recentMarks = <AttendanceRecord>[];
   Timer? _clockTimer;
   DateTime _now = DateTime.now();
