@@ -91,45 +91,7 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
   }
 
 
-  Widget _buildQrTab(BuildContext context) {
-    return MobileScanner(
-      onDetect: (capture) {
-        final code = capture.barcodes.isNotEmpty
-            ? capture.barcodes.first.rawValue
-            : null;
-        if (code != null) {
-          _handleSubmit(code, AttendanceType.inScan);
-        }
-      },
-    );
-  }
-
-  Future<void> _scanThumb(BuildContext context) async {
-    final bool canCheck = await _auth.canCheckBiometrics;
-    if (!canCheck) {
-      if (!context.mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('Biometrics not available')));
-      return;
-    }
-    final bool ok = await _auth.authenticate(
-      localizedReason: 'Scan your thumb to mark attendance',
-      options: const AuthenticationOptions(biometricOnly: true),
-    );
-    if (ok) {
-      final code = _codeController.text.trim();
-      if (code.isEmpty) {
-        if (!context.mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Enter employee code for mapping')),
-        );
-        return;
-      }
-      if (!mounted) return;
-      await _handleSubmit(code, AttendanceType.inScan);
-    }
-  }
+  
 
   @override
   Widget build(BuildContext context) {
