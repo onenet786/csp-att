@@ -34,6 +34,13 @@ function normalizeCode(code) {
   return s.replace(/^[^A-Za-z0-9]+/, "");
 }
 
+// Build the base URL used in responses (e.g., photo links)
+function getPublicBaseUrl() {
+  const host = String(process.env.PUBLIC_HOST || "localhost").trim();
+  const port = Number(process.env.PORT || 3010);
+  return `http://${host}:${port}`;
+}
+
 app.get("/health", (req, res) => {
   res.json({ ok: true });
 });
@@ -220,13 +227,13 @@ app.get("/employees/:code", async (req, res) => {
     let imageUrl = employee?.imageUrl ?? null;
     const isValidStringUrl = typeof imageUrl === "string" && imageUrl.trim() !== "";
     if (!isValidStringUrl && employee?.id != null) {
-      const port = process.env.PORT || 3010;
-      imageUrl = `http://localhost:${port}/employees/${employee.id}/photo`;
+      const baseUrl = getPublicBaseUrl();
+      imageUrl = `${baseUrl}/employees/${employee.id}/photo`;
     } else if (isValidStringUrl) {
       const s = imageUrl.trim();
       if (!/^https?:\/\//i.test(s)) {
-        const port = process.env.PORT || 3010;
-        imageUrl = `http://localhost:${port}/${s.replace(/^\/+/, "")}`;
+        const baseUrl = getPublicBaseUrl();
+        imageUrl = `${baseUrl}/${s.replace(/^\/+/, "")}`;
       }
     }
     res.json({ employee: { ...employee, imageUrl } });
@@ -331,13 +338,13 @@ app.get("/employees/:code/attendance-times", async (req, res) => {
       let imageUrl = employee?.imageUrl ?? null;
       const isValidStringUrl = typeof imageUrl === "string" && imageUrl.trim() !== "";
       if (!isValidStringUrl && employee?.id != null) {
-        const port = process.env.PORT || 3010;
-        imageUrl = `http://localhost:${port}/employees/${employee.id}/photo`;
+        const baseUrl = getPublicBaseUrl();
+        imageUrl = `${baseUrl}/employees/${employee.id}/photo`;
       } else if (isValidStringUrl) {
         const s = imageUrl.trim();
         if (!/^https?:\/\//i.test(s)) {
-          const port = process.env.PORT || 3010;
-          imageUrl = `http://localhost:${port}/${s.replace(/^\/+/, "")}`;
+          const baseUrl = getPublicBaseUrl();
+          imageUrl = `${baseUrl}/${s.replace(/^\/+/, "")}`;
         }
       }
       const employeeOut = employee ? { ...employee, code: rawCode, imageUrl } : null;
@@ -374,13 +381,13 @@ app.get("/employees/:code/attendance-times", async (req, res) => {
     let imageUrl = employee?.imageUrl ?? null;
     const isValidStringUrl = typeof imageUrl === "string" && imageUrl.trim() !== "";
     if (!isValidStringUrl && employee?.id != null) {
-      const port = process.env.PORT || 3010;
-      imageUrl = `http://localhost:${port}/employees/${employee.id}/photo`;
+      const baseUrl = getPublicBaseUrl();
+      imageUrl = `${baseUrl}/employees/${employee.id}/photo`;
     } else if (isValidStringUrl) {
       const s = imageUrl.trim();
       if (!/^https?:\/\//i.test(s)) {
-        const port = process.env.PORT || 3010;
-        imageUrl = `http://localhost:${port}/${s.replace(/^\/+/, "")}`;
+        const baseUrl = getPublicBaseUrl();
+        imageUrl = `${baseUrl}/${s.replace(/^\/+/, "")}`;
       }
     }
     const employeeOut = employee ? { ...employee, code: rawCode, imageUrl } : null;
