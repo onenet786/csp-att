@@ -120,12 +120,14 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
 
     // If check-in failed for any reason, prompt for checkout reason automatically
     if (type == AttendanceType.inScan) {
+      if (!mounted) return false;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(provider.errorMessage == null
             ? 'Check-In failed. Select a reason to check-out'
             : '${provider.errorMessage}. Select a reason to check-out')),
       );
       final picked = await _showReasonPicker();
+      if (!mounted) return false;
       if (picked != null && picked.trim().isNotEmpty) {
         final chosen = picked.trim();
         setState(() {
@@ -134,6 +136,7 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
         // Submit checkout with selected reason
         return _handleSubmit(trimmedCode, AttendanceType.outScan, reason: chosen);
       } else {
+        if (!mounted) return false;
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Checkout requires reason. Use hotkeys 1..9,0,+,-')),
         );
@@ -142,6 +145,7 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
     }
 
     // Default failure path
+    if (!mounted) return false;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(provider.errorMessage ?? 'Failed to mark attendance'),
@@ -175,6 +179,7 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
       final isIn = (status['status']?.toString().toUpperCase() == 'IN');
       if (isIn) {
         final picked = await _showReasonPicker();
+        if (!mounted) return;
         if (picked != null && picked.trim().isNotEmpty) {
           final reason = picked.trim();
           setState(() {
@@ -182,6 +187,7 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
           });
           await _handleSubmit(trimmed, AttendanceType.outScan, reason: reason);
         } else {
+          if (!mounted) return;
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(content: Text('Checkout requires reason. Use hotkeys 1..9,0,+,-')),
           );
@@ -231,8 +237,8 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
     );
   }
 
-  String? _reasonFromKey(RawKeyEvent e) {
-    if (e is! RawKeyDownEvent) return null;
+  String? _reasonFromKey(KeyEvent e) {
+    if (e is! KeyDownEvent) return null;
     final ch = e.character;
     const map = {
       '1': 'Personal',
@@ -261,7 +267,7 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
     return null;
   }
 
-  void _onRawKey(RawKeyEvent e) {
+  void _onKeyEvent(KeyEvent e) {
     final reason = _reasonFromKey(e);
     if (reason != null) {
       final code = _codeController.text.trim();
@@ -313,10 +319,10 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
           ),
         ],
       ),
-      body: RawKeyboardListener(
+      body: KeyboardListener(
         focusNode: _hotkeyFocus,
         autofocus: true,
-        onKey: _onRawKey,
+        onKeyEvent: _onKeyEvent,
         child: Stack(
         children: [
           Padding(

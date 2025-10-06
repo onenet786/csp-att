@@ -29,6 +29,11 @@ async function getPool() {
   return poolPromise;
 }
 
+function normalizeCode(code) {
+  const s = String(code || "").trim();
+  return s.replace(/^[^A-Za-z0-9]+/, "");
+}
+
 app.get("/health", (req, res) => {
   res.json({ ok: true });
 });
@@ -42,6 +47,28 @@ app.get("/db/health", async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ ok: false, error: "DB connect/query failed" });
+  }
+});
+
+// GET /db/leave-types -> return all rows from leave_type table and log to console
+app.get("/db/leave-types", async (req, res) => {
+  try {
+    const pool = await getPool();
+    const info = await getTableSchemaAndName(pool, "leave_type");
+    if (!info) {
+      return res.status(404).json({ error: "leave_type table not found" });
+    }
+    const fullName = `${quoteIdent(info.schema)}.${quoteIdent(info.name)}`;
+    const result = await pool.request().query(`SELECT * FROM ${fullName}`);
+    const rows = result.recordset || [];
+    console.log(`Fetched ${rows.length} rows from leave_type`);
+    if (rows.length) {
+      console.log("Sample rows:", rows.slice(0, Math.min(5, rows.length)));
+    }
+    res.json({ table: info.name, count: rows.length, rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Failed to fetch leave_type", details: e.message });
   }
 });
 
@@ -80,45 +107,54 @@ async function tableHasName(pool, name) {
 }
 
 async function getEmployeeByCode(pool, code) {
+  const normalized = normalizeCode(code);
+  const candidates = [normalized];
+  if (normalized !== code) candidates.push(String(code));
+  // Try known tables with both normalized and raw code values
   if (await tableHasName(pool, "Employees")) {
-    const r1 = await pool
-      .request()
-      .input("code", sql.VarChar(50), code)
-      .query(
-        "SELECT TOP 1 Id as id, employee_code as code, Name as name, Designation as designation, Department as department, PhotoUrl as imageUrl FROM Employees WHERE employee_code = @code"
-      );
-    if (r1.recordset?.[0]) return r1.recordset[0];
-    const r2 = await pool
-      .request()
-      .input("code", sql.VarChar(50), code)
-      .query(
-        "SELECT TOP 1 Id as id, Code as code, Name as name, Designation as designation, Department as department, PhotoUrl as imageUrl FROM Employees WHERE Code = @code"
-      );
-    if (r2.recordset?.[0]) return r2.recordset[0];
+    for (const c of candidates) {
+      const r1 = await pool
+        .request()
+        .input("code", sql.VarChar(50), c)
+        .query(
+          "SELECT TOP 1 Id as id, employee_code as code, Name as name, Designation as designation, Department as department, PhotoUrl as imageUrl FROM Employees WHERE employee_code = @code"
+        );
+      if (r1.recordset?.[0]) return r1.recordset[0];
+      const r2 = await pool
+        .request()
+        .input("code", sql.VarChar(50), c)
+        .query(
+          "SELECT TOP 1 Id as id, Code as code, Name as name, Designation as designation, Department as department, PhotoUrl as imageUrl FROM Employees WHERE Code = @code"
+        );
+      if (r2.recordset?.[0]) return r2.recordset[0];
+    }
   }
   if (await tableHasName(pool, "employee")) {
-    const r1 = await pool
-      .request()
-      .input("code", sql.VarChar(50), code)
-      .query(
-        "SELECT TOP 1 employee_id as id, employee_code as code, employee_name as name, NULL as designation, NULL as department, employee_image as imageUrl FROM employee WHERE employee_code = @code"
-      );
-    if (r1.recordset?.[0]) return r1.recordset[0];
-    const r2 = await pool
-      .request()
-      .input("code", sql.VarChar(50), code)
-      .query(
-        "SELECT TOP 1 employee_id as id, employee_bar_code as code, employee_name as name, NULL as designation, NULL as department, employee_image as imageUrl FROM employee WHERE employee_bar_code = @code"
-      );
-    if (r2.recordset?.[0]) return r2.recordset[0];
+    for (const c of candidates) {
+      const r1 = await pool
+        .request()
+        .input("code", sql.VarChar(50), c)
+        .query(
+          "SELECT TOP 1 employee_id as id, employee_code as code, employee_name as name, NULL as designation, NULL as department, employee_image as imageUrl FROM employee WHERE employee_code = @code"
+        );
+      if (r1.recordset?.[0]) return r1.recordset[0];
+      const r2 = await pool
+        .request()
+        .input("code", sql.VarChar(50), c)
+        .query(
+          "SELECT TOP 1 employee_id as id, employee_bar_code as code, employee_name as name, NULL as designation, NULL as department, employee_image as imageUrl FROM employee WHERE employee_bar_code = @code"
+        );
+      if (r2.recordset?.[0]) return r2.recordset[0];
+    }
   }
   return null;
 }
 
 async function resolveEmployeeId(pool, code) {
-  const emp = await getEmployeeByCode(pool, code);
+  const normalized = normalizeCode(code);
+  const emp = await getEmployeeByCode(pool, normalized);
   if (emp?.id != null) return emp.id;
-  const parsed = Number(code);
+  const parsed = Number(normalized);
   if (Number.isFinite(parsed)) return parsed;
   return null;
 }
@@ -159,13 +195,39 @@ app.get("/db/sample", async (req, res) => {
 app.get("/employees/:code", async (req, res) => {
   try {
     const pool = await getPool();
-    const employee = await getEmployeeByCode(pool, req.params.code);
+    const rawCode = String(req.params.code || "").trim();
+    const code = normalizeCode(rawCode);
+    let employee = await getEmployeeByCode(pool, code);
+
+    // If not found in known employee tables, try resolving numeric employee_id
+    if (!employee) {
+      const employeeId = await resolveEmployeeId(pool, code);
+      if (employeeId) {
+        employee = {
+          id: employeeId,
+          code: rawCode, // preserve the user-entered code (e.g. "/004")
+          name: null,
+          designation: null,
+          department: null,
+          imageUrl: null,
+        };
+      }
+    }
+
     if (!employee) return res.json({ employee: null });
+
     // Prefer existing imageUrl; otherwise, expose our photo endpoint for this employee id
-    let imageUrl = employee.imageUrl || null;
-    if (!imageUrl && employee.id != null) {
+    let imageUrl = employee?.imageUrl ?? null;
+    const isValidStringUrl = typeof imageUrl === "string" && imageUrl.trim() !== "";
+    if (!isValidStringUrl && employee?.id != null) {
       const port = process.env.PORT || 3010;
       imageUrl = `http://localhost:${port}/employees/${employee.id}/photo`;
+    } else if (isValidStringUrl) {
+      const s = imageUrl.trim();
+      if (!/^https?:\/\//i.test(s)) {
+        const port = process.env.PORT || 3010;
+        imageUrl = `http://localhost:${port}/${s.replace(/^\/+/, "")}`;
+      }
     }
     res.json({ employee: { ...employee, imageUrl } });
   } catch (e) {
@@ -228,11 +290,12 @@ app.get("/employees/:id/photo", async (req, res) => {
 // GET /employees/:code/attendance-times
 // Returns employee details along with today's first check-in and last check-out times.
 app.get("/employees/:code/attendance-times", async (req, res) => {
-  const code = req.params.code;
+  const rawCode = String(req.params.code || "").trim();
+  const code = normalizeCode(rawCode);
   if (!code) return res.status(400).json({ error: "Missing employee code" });
   try {
     const pool = await getPool();
-    const employee = await getEmployeeByCode(pool, code);
+    let employee = await getEmployeeByCode(pool, code);
 
     // Detect attendance schema
     const attendanceColumns = await getAttendanceColumns(pool);
@@ -257,13 +320,28 @@ app.get("/employees/:code/attendance-times", async (req, res) => {
         );
       inTime = rIn.recordset?.[0]?.ts ? new Date(rIn.recordset[0].ts).toISOString() : null;
       outTime = rOut.recordset?.[0]?.ts ? new Date(rOut.recordset[0].ts).toISOString() : null;
+      // If employee not found in tables, synthesize with raw code when possible
+      if (!employee) {
+        const empId = await resolveEmployeeId(pool, code);
+        if (empId) {
+          employee = { id: empId, code: rawCode, name: null, designation: null, department: null, imageUrl: null };
+        }
+      }
       // Inject imageUrl fallback for legacy schema
-      let imageUrl = employee?.imageUrl || null;
-      if (!imageUrl && employee?.id != null) {
+      let imageUrl = employee?.imageUrl ?? null;
+      const isValidStringUrl = typeof imageUrl === "string" && imageUrl.trim() !== "";
+      if (!isValidStringUrl && employee?.id != null) {
         const port = process.env.PORT || 3010;
         imageUrl = `http://localhost:${port}/employees/${employee.id}/photo`;
+      } else if (isValidStringUrl) {
+        const s = imageUrl.trim();
+        if (!/^https?:\/\//i.test(s)) {
+          const port = process.env.PORT || 3010;
+          imageUrl = `http://localhost:${port}/${s.replace(/^\/+/, "")}`;
+        }
       }
-      return res.json({ employee: employee ? { ...employee, imageUrl } : null, today: { inTime, outTime }, schema });
+      const employeeOut = employee ? { ...employee, code: rawCode, imageUrl } : null;
+      return res.json({ employee: employeeOut, today: { inTime, outTime }, schema, employee_code: rawCode });
     }
 
     // Current attendance schema
@@ -288,13 +366,25 @@ app.get("/employees/:code/attendance-times", async (req, res) => {
     const rOut = await pool.request().input("employee_id", sql.Int, employeeId).query(qOut);
     inTime = rIn.recordset?.[0]?.inTime ? new Date(rIn.recordset[0].inTime).toISOString() : null;
     outTime = rOut.recordset?.[0]?.outTime ? new Date(rOut.recordset[0].outTime).toISOString() : null;
+    // If employee not found in tables, synthesize with raw code
+    if (!employee) {
+      employee = { id: employeeId, code: rawCode, name: null, designation: null, department: null, imageUrl: null };
+    }
     // Inject imageUrl fallback for attendance schema
-    let imageUrl = employee?.imageUrl || null;
-    if (!imageUrl && employee?.id != null) {
+    let imageUrl = employee?.imageUrl ?? null;
+    const isValidStringUrl = typeof imageUrl === "string" && imageUrl.trim() !== "";
+    if (!isValidStringUrl && employee?.id != null) {
       const port = process.env.PORT || 3010;
       imageUrl = `http://localhost:${port}/employees/${employee.id}/photo`;
+    } else if (isValidStringUrl) {
+      const s = imageUrl.trim();
+      if (!/^https?:\/\//i.test(s)) {
+        const port = process.env.PORT || 3010;
+        imageUrl = `http://localhost:${port}/${s.replace(/^\/+/, "")}`;
+      }
     }
-    return res.json({ employee: employee ? { ...employee, imageUrl } : null, today: { inTime, outTime }, schema, employee_id: employeeId });
+    const employeeOut = employee ? { ...employee, code: rawCode, imageUrl } : null;
+    return res.json({ employee: employeeOut, today: { inTime, outTime }, schema, employee_id: employeeId, employee_code: rawCode });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Failed to get employee attendance times", details: e.message });
@@ -306,8 +396,9 @@ app.get("/employees/:code/attendance-times", async (req, res) => {
 // including latest reason and timestamp. Supports legacy `Attendance` and
 // current `attendance` table schemas.
 app.get("/attendance/status/:code", async (req, res) => {
-  const code = req.params.code;
-  if (!code) return res.status(400).json({ error: "Missing employee code" });
+  const rawCode = String(req.params.code || "").trim();
+  const normalizedCode = normalizeCode(rawCode);
+  if (!normalizedCode) return res.status(400).json({ error: "Missing employee code" });
   try {
     const pool = await getPool();
     const attendanceColumns = await getAttendanceColumns(pool);
@@ -319,7 +410,7 @@ app.get("/attendance/status/:code", async (req, res) => {
     if (!attendanceColumns.length) {
       const rToday = await pool
         .request()
-        .input("employeeCode", sql.VarChar(50), code)
+        .input("employeeCode", sql.VarChar(50), normalizedCode)
         .query(
           "SELECT TOP 1 Type AS type, Reason AS reason, TimeStamp AS ts FROM Attendance WHERE EmployeeCode = @employeeCode AND CAST(TimeStamp AS date) = CAST(GETDATE() AS date) ORDER BY TimeStamp DESC"
         );
@@ -327,7 +418,7 @@ app.get("/attendance/status/:code", async (req, res) => {
       if (!row) {
         const rAny = await pool
           .request()
-          .input("employeeCode", sql.VarChar(50), code)
+          .input("employeeCode", sql.VarChar(50), normalizedCode)
           .query(
             "SELECT TOP 1 Type AS type, Reason AS reason, TimeStamp AS ts FROM Attendance WHERE EmployeeCode = @employeeCode ORDER BY TimeStamp DESC"
           );
@@ -339,14 +430,14 @@ app.get("/attendance/status/:code", async (req, res) => {
         latestReason = row.reason || null;
         latestTimestamp = row.ts ? new Date(row.ts).toISOString() : null;
       }
-      return res.json({ status, reason: latestReason, timestamp: latestTimestamp, schema: "legacy" });
+      return res.json({ status, reason: latestReason, timestamp: latestTimestamp, schema: "legacy", employee_code: rawCode });
     }
 
     // Current schema: attendance(employee_id, attendance_reason, attendance_type, attendance_seqno, ...)
     // Resolve employee_id based on employeeCode
-    const employeeId = await resolveEmployeeId(pool, code);
+    const employeeId = await resolveEmployeeId(pool, normalizedCode);
     if (!employeeId) {
-      return res.status(404).json({ error: "Employee not found for code", code });
+      return res.status(404).json({ error: "Employee not found for code", code: normalizedCode });
     }
 
     const info = await getTableSchemaAndName(pool, "attendance");
@@ -366,7 +457,7 @@ app.get("/attendance/status/:code", async (req, res) => {
       latestReason = row.reason || null;
       latestTimestamp = row.ts ? new Date(row.ts).toISOString() : null;
     }
-    return res.json({ status, reason: latestReason, timestamp: latestTimestamp, schema: "attendance", employee_id: employeeId });
+    return res.json({ status, reason: latestReason, timestamp: latestTimestamp, schema: "attendance", employee_id: employeeId, employee_code: rawCode });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Failed to get status", details: e.message });
@@ -398,9 +489,10 @@ app.post("/attendance/mark", async (req, res) => {
     }
 
     // Resolve employee_id based on employeeCode
-    const employeeId = await resolveEmployeeId(pool, employeeCode);
+    const normalizedCode = normalizeCode(employeeCode);
+    const employeeId = await resolveEmployeeId(pool, normalizedCode);
     if (!employeeId) {
-      return res.status(404).json({ error: "Employee not found for code", code: employeeCode });
+      return res.status(404).json({ error: "Employee not found for code", code: normalizedCode });
     }
 
     // Check if the lowercase `attendance` table exists; if not, fall back to legacy insert
@@ -410,7 +502,7 @@ app.post("/attendance/mark", async (req, res) => {
       if (attendanceType === "In") {
         const latestToday = await pool
           .request()
-          .input("employeeCode", sql.VarChar(50), employeeCode)
+          .input("employeeCode", sql.VarChar(50), normalizedCode)
           .query(
             "SELECT TOP 1 Type AS type FROM Attendance WHERE EmployeeCode = @employeeCode AND CAST(TimeStamp AS date) = CAST(GETDATE() AS date) ORDER BY TimeStamp DESC"
           );
@@ -423,7 +515,7 @@ app.post("/attendance/mark", async (req, res) => {
       if (attendanceType === "In") {
         const dutyOffToday = await pool
           .request()
-          .input("employeeCode", sql.VarChar(50), employeeCode)
+          .input("employeeCode", sql.VarChar(50), normalizedCode)
           .query(
             "SELECT TOP 1 1 AS ok FROM Attendance WHERE EmployeeCode = @employeeCode AND LOWER(Reason) = 'duty off' AND CAST(TimeStamp AS date) = CAST(GETDATE() AS date)"
           );
@@ -434,7 +526,7 @@ app.post("/attendance/mark", async (req, res) => {
       // Legacy/alternate schema: insert into "Attendance" table with code-based columns
       await pool
         .request()
-        .input("employeeCode", sql.VarChar(50), employeeCode)
+        .input("employeeCode", sql.VarChar(50), normalizedCode)
         .input("timestamp", sql.DateTime2, timestamp ? new Date(timestamp) : new Date())
         .input("reason", sql.VarChar(100), reason || "Duty")
         .input("type", sql.VarChar(20), attendanceType)

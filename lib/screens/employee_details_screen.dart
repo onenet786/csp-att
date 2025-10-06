@@ -102,8 +102,8 @@ class _EmployeeDetailsScreenState extends State<EmployeeDetailsScreen> {
                                 child: Column(
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
-                                    _detailRow('Employee Code', employee.code ?? ''),
-                                    _detailRow('Employee Name', employee.name ?? ''),
+                                    _detailRow('Employee Code', employee.code),
+                                    _detailRow('Employee Name', employee.name),
                                     _detailRow('Designation', employee.designation ?? ''),
                                     _detailRow('Department', employee.department ?? ''),
                                   ],
