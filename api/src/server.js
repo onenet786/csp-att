@@ -72,69 +72,29 @@ app.get("/db/leave-types", async (req, res) => {
     if (rows.length) {
       console.log("Sample rows:", rows.slice(0, Math.min(5, rows.length)));
     }
-    res.json({ table: info.name, count: rows.length, rows });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "Failed to fetch leave_type", details: e.message });
+    res.json({ rows });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Failed to fetch leave types" });
   }
 });
 
-// Utility to safely quote SQL identifiers (table/column names)
-function quoteIdent(name) {
-  return `[${String(name).replace(/]/g, ']]')}]`;
-}
-
-// Row count for a table
-async function getTableRowCount(pool, tableName) {
-  const r = await pool
-    .request()
-    .input("t", sql.NVarChar(128), tableName)
-    .query(
-      "SELECT SUM(p.rows) AS row_count FROM sys.tables t JOIN sys.partitions p ON t.object_id = p.object_id WHERE t.name = @t AND p.index_id IN (0,1) GROUP BY t.name"
-    );
-  return r.recordset?.[0]?.row_count || 0;
-}
-
-// Find first user table name that has at least one row
-async function getFirstUserTableWithRows(pool) {
-  const res = await pool
-    .request()
-    .query(
-      "SELECT TOP 1 t.name, SUM(p.rows) AS row_count FROM sys.tables t JOIN sys.partitions p ON t.object_id = p.object_id WHERE t.is_ms_shipped = 0 AND p.index_id IN (0,1) GROUP BY t.name HAVING SUM(p.rows) > 0 ORDER BY row_count DESC"
-    );
-  return res.recordset?.[0]?.name || null;
-}
-
-async function tableHasName(pool, name) {
-  const r = await pool
-    .request()
-    .input("t", sql.NVarChar(128), name)
-    .query("SELECT 1 AS ok FROM sys.tables WHERE name = @t");
-  return !!r.recordset?.[0]?.ok;
-}
-
-async function getEmployeeByCode(pool, code) {
-  const normalized = normalizeCode(code);
-  const candidates = [normalized];
-  if (normalized !== code) candidates.push(String(code));
-  // Try known tables with both normalized and raw code values
+async function findEmployeeByCode(pool, c) {
   if (await tableHasName(pool, "Employees")) {
-    for (const c of candidates) {
-      const r1 = await pool
-        .request()
-        .input("code", sql.VarChar(50), c)
-        .query(
-          "SELECT TOP 1 Id as id, employee_code as code, Name as name, Designation as designation, Department as department, PhotoUrl as imageUrl FROM Employees WHERE employee_code = @code"
-        );
-      if (r1.recordset?.[0]) return r1.recordset[0];
-      const r2 = await pool
-        .request()
-        .input("code", sql.VarChar(50), c)
-        .query(
-          "SELECT TOP 1 Id as id, Code as code, Name as name, Designation as designation, Department as department, PhotoUrl as imageUrl FROM Employees WHERE Code = @code"
-        );
-      if (r2.recordset?.[0]) return r2.recordset[0];
-    }
+    const r1 = await pool
+      .request()
+      .input("code", sql.VarChar(50), c)
+      .query(
+        "SELECT TOP 1 Id as id, employee_code as code, Name as name, Designation as designation, Department as department, PhotoUrl as imageUrl FROM Employees WHERE employee_code = @code"
+      );
+    if (r1.recordset?.[0]) return r1.recordset[0];
+    const r2 = await pool
+      .request()
+      .input("code", sql.VarChar(50), c)
+      .query(
+        "SELECT TOP 1 Id as id, Code as code, Name as name, Designation as designation, Department as department, PhotoUrl as imageUrl FROM Employees WHERE Code = @code"
+      );
+    if (r2.recordset?.[0]) return r2.recordset[0];
   }
   if (await tableHasName(pool, "employee")) {
     for (const c of candidates) {
@@ -159,72 +119,51 @@ async function getEmployeeByCode(pool, code) {
 
 async function resolveEmployeeId(pool, code) {
   const normalized = normalizeCode(code);
-  const emp = await getEmployeeByCode(pool, normalized);
-  if (emp?.id != null) return emp.id;
-  const parsed = Number(normalized);
-  if (Number.isFinite(parsed)) return parsed;
-  return null;
-}
-
-// GET /db/sample?table=TableName -> returns TOP 1 * from the specified or first table
-app.get("/db/sample", async (req, res) => {
   try {
-    const pool = await getPool();
-    let tableName = (req.query.table || "").trim();
-
-    if (tableName) {
-      // Validate requested table exists
-      const exists = await pool
-        .request()
-        .input("t", sql.NVarChar(128), tableName)
-        .query("SELECT 1 AS ok FROM sys.tables WHERE name = @t");
-      if (!exists.recordset?.[0]?.ok) {
-        return res.status(404).json({ error: `Table not found: ${tableName}` });
-      }
-    } else {
-      tableName = await getFirstUserTableWithRows(pool);
-      if (!tableName) {
-        return res.status(404).json({ error: "No tables with rows found" });
-      }
+    // Check if Employees table exists
+    const exists = await pool
+      .request()
+      .input("t", sql.NVarChar(128), "Employees")
+      .query("SELECT 1 AS ok FROM sys.tables WHERE name = @t");
+    if (!exists.recordset?.[0]?.ok) {
+      // Gracefully return null if Employees table isn't present
+      return null;
     }
-
-    const q = `SELECT TOP 1 * FROM ${quoteIdent(tableName)}`;
-    const result = await pool.request().query(q);
-    const rowCount = await getTableRowCount(pool, tableName);
-    res.json({ table: tableName, rowCount, record: result.recordset?.[0] || null });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "Failed to fetch sample record" });
+    const result = await pool
+      .request()
+      .input("code", sql.VarChar(50), normalized)
+      .query(
+        "SELECT TOP 1 Code as code, Name as name, Designation as designation, Department as department, PhotoUrl as imageUrl FROM Employees WHERE Code = @code"
+      );
+    return result.recordset[0] || null;
+  } catch (error) {
+    console.error("Error resolving employee ID:", error);
+    return null;
   }
-});
+}
 
 // GET /employees/:code
 app.get("/employees/:code", async (req, res) => {
   try {
     const pool = await getPool();
-    const rawCode = String(req.params.code || "").trim();
-    const code = normalizeCode(rawCode);
-    let employee = await getEmployeeByCode(pool, code);
-
-    // If not found in known employee tables, try resolving numeric employee_id
-    if (!employee) {
-      const employeeId = await resolveEmployeeId(pool, code);
-      if (employeeId) {
-        employee = {
-          id: employeeId,
-          code: rawCode, // preserve the user-entered code (e.g. "/004")
-          name: null,
-          designation: null,
-          department: null,
-          imageUrl: null,
-        };
-      }
+    const code = normalizeCode(req.params.code);
+    
+    // Fetch employee info (if available)
+    let employee = null;
+    try {
+      const empRes = await pool
+        .request()
+        .input("code", sql.VarChar(50), code)
+        .query(
+          "SELECT TOP 1 Code as code, Name as name, Designation as designation, Department as department, PhotoUrl as imageUrl FROM Employees WHERE Code = @code"
+        );
+      employee = empRes.recordset?.[0] || null;
+    } catch (_) {
+      employee = null;
     }
-
-    if (!employee) return res.json({ employee: null });
-
-    // Prefer existing imageUrl; otherwise, expose our photo endpoint for this employee id
-    let imageUrl = employee?.imageUrl ?? null;
+    
+    // Process image URL
+    let imageUrl = employee?.imageUrl || "";
     const isValidStringUrl = typeof imageUrl === "string" && imageUrl.trim() !== "";
     if (!isValidStringUrl && employee?.id != null) {
       const baseUrl = getPublicBaseUrl();
@@ -247,54 +186,58 @@ app.get("/employees/:code", async (req, res) => {
 // Streams the employee image bytes (from `employee.employee_image`) if available,
 // otherwise redirects to `Employees.PhotoUrl` when present.
 app.get("/employees/:id/photo", async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    if (!Number.isFinite(id) || id <= 0) {
-      return res.status(400).json({ error: "Invalid employee id" });
-    }
-    const pool = await getPool();
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid employee ID" });
 
-    // Try varbinary image from `employee` table
-    if (await tableHasName(pool, "employee")) {
-      const r = await pool
-        .request()
+  try {
+    const pool = await getPool();
+    
+    // Try to get employee image from employee table
+    try {
+      const r = await pool.request()
         .input("id", sql.Int, id)
-        .query("SELECT TOP 1 employee_image AS img FROM employee WHERE employee_id = @id");
-      const buf = r.recordset?.[0]?.img;
-      if (buf) {
-        // Detect common image formats by magic numbers
+        .query("SELECT employee_image FROM employee WHERE employee_id = @id");
+      
+      if (r.recordset?.[0]?.employee_image) {
+        const buf = r.recordset[0].employee_image;
         let contentType = "application/octet-stream";
+        
         if (Buffer.isBuffer(buf)) {
           const b0 = buf[0], b1 = buf[1], b2 = buf[2], b3 = buf[3];
           if (b0 === 0xff && b1 === 0xd8 && b2 === 0xff) contentType = "image/jpeg";
           else if (b0 === 0x89 && b1 === 0x50 && b2 === 0x4e && b3 === 0x47) contentType = "image/png";
-          else if (b0 === 0x47 && b1 === 0x49 && b2 === 0x46 && b3 === 0x38) contentType = "image/gif";
         }
+        
         res.setHeader("Content-Type", contentType);
         return res.send(buf);
       }
+    } catch (error) {
+      console.error("Error fetching employee image:", error);
     }
 
     // Fallback: redirect to PhotoUrl from `Employees` table
-    if (await tableHasName(pool, "Employees")) {
-      const r = await pool
-        .request()
-        .input("id", sql.Int, id)
-        .query("SELECT TOP 1 PhotoUrl AS url FROM Employees WHERE Id = @id");
-      const url = r.recordset?.[0]?.url;
-      if (url) {
-        return res.redirect(url);
+    try {
+      if (await tableHasName(pool, "Employees")) {
+        const r = await pool
+          .request()
+          .input("id", sql.Int, id)
+          .query("SELECT TOP 1 PhotoUrl AS url FROM Employees WHERE Id = @id");
+        const url = r.recordset?.[0]?.url;
+        if (url) {
+          return res.redirect(url);
+        }
       }
+    } catch (error) {
+      console.error("Error fetching employee photo URL:", error);
     }
 
     return res.status(404).json({ error: "Employee photo not found" });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: "Failed to fetch employee photo" });
+  } catch (error) {
+    console.error("Error in employee photo endpoint:", error);
+    return res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// GET /employees/:code/attendance-times
 // Returns employee details along with today's first check-in and last check-out times.
 app.get("/employees/:code/attendance-times", async (req, res) => {
   const rawCode = String(req.params.code || "").trim();
@@ -344,7 +287,20 @@ app.get("/employees/:code/attendance-times", async (req, res) => {
         const s = imageUrl.trim();
         if (!/^https?:\/\//i.test(s)) {
           const baseUrl = getPublicBaseUrl();
-          imageUrl = `${baseUrl}/${s.replace(/^\/+/, "")}`;
+    let employeeId;
+    try {
+      const empResult = await pool
+        .request()
+        .input("code", sql.VarChar(50), code)
+        .query("SELECT TOP 1 Id AS id FROM Employees WHERE Code = @code");
+      employeeId = empResult.recordset?.[0]?.id;
+    } catch (_) {
+      employeeId = undefined;
+    }
+    if (!employeeId) {
+      const parsed = Number(code);
+      if (Number.isFinite(parsed)) employeeId = parsed;
+    }
         }
       }
       const employeeOut = employee ? { ...employee, code: rawCode, imageUrl } : null;
@@ -398,7 +354,6 @@ app.get("/employees/:code/attendance-times", async (req, res) => {
   }
 });
 
-// GET /attendance/status/:code
 // Returns current status (IN/OUT) based on latest record for today (if possible),
 // including latest reason and timestamp. Supports legacy `Attendance` and
 // current `attendance` table schemas.
@@ -763,4 +718,3 @@ app.post("/attendance/insert", async (req, res) => {
 
 const port = Number(process.env.PORT || 3000);
 app.listen(port, () => console.log(`API listening on :${port}`));
-

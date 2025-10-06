@@ -4,8 +4,6 @@ import 'package:employee_attendance/providers/attendance_provider.dart';
 import 'package:employee_attendance/screens/employee_details_screen.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-// local_auth removed due to unused thumb scan
-// mobile_scanner removed due to unused QR tab
 import 'package:provider/provider.dart';
 
 class MarkAttendanceScreen extends StatefulWidget {
@@ -23,11 +21,12 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
   );
   final TextEditingController _codeController = TextEditingController();
   final FocusNode _hotkeyFocus = FocusNode(debugLabel: 'hotkey_focus');
-  // LocalAuthentication removed due to unused thumb scan
   final List<AttendanceRecord> _recentMarks = <AttendanceRecord>[];
   Timer? _clockTimer;
   DateTime _now = DateTime.now();
   AttendanceType? _lastType;
+  Timer? _searchDebounce;
+  String _lastLoadedCode = '';
   String? _selectedReason;
 
   @override
@@ -36,6 +35,7 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
     _codeController.dispose();
     _hotkeyFocus.dispose();
     _clockTimer?.cancel();
+    _searchDebounce?.cancel();
     super.dispose();
   }
 
@@ -198,6 +198,25 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
     }
   }
 
+  void _onCodeChanged(String value) {
+    final trimmed = value.trim();
+    _searchDebounce?.cancel();
+    if (trimmed.isEmpty) return;
+    _searchDebounce = Timer(const Duration(milliseconds: 400), () {
+      if (!mounted) return;
+      if (trimmed == _lastLoadedCode) return;
+      _autoLoadInfo(trimmed);
+    });
+  }
+
+  Future<void> _autoLoadInfo(String code) async {
+    final provider = context.read<AttendanceProvider>();
+    await provider.loadEmployee(code);
+    if (!mounted) return;
+    _lastLoadedCode = code;
+    setState(() {});
+  }
+
   Future<String?> _showReasonPicker() async {
     const reasons = [
       'Personal',
@@ -341,6 +360,7 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
                                 labelText: 'Enter Employee Code',
                                 border: OutlineInputBorder(),
                               ),
+                              onChanged: _onCodeChanged,
                               onSubmitted: (_) => _loadInfo(
                                 _codeController.text.trim(),
                               ),
@@ -655,7 +675,7 @@ String _formatLongDate(DateTime date) {
 }
 
 String _formatMaybeTime(BuildContext context, DateTime? dt) {
-  if (dt == null) return '';
+  if (dt == null) return 'Not recorded';
   try {
     return TimeOfDay.fromDateTime(dt).format(context);
   } catch (_) {

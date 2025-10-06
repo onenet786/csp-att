@@ -104,8 +104,10 @@ class _EmployeeDetailsScreenState extends State<EmployeeDetailsScreen> {
                                   children: [
                                     _detailRow('Employee Code', employee.code),
                                     _detailRow('Employee Name', employee.name),
-                                    _detailRow('Designation', employee.designation ?? ''),
-                                    _detailRow('Department', employee.department ?? ''),
+                                    _detailRow('Designation',
+                                        employee.designation ?? ''),
+                                    _detailRow('Department',
+                                        employee.department ?? ''),
                                   ],
                                 ),
                               ),
@@ -118,7 +120,8 @@ class _EmployeeDetailsScreenState extends State<EmployeeDetailsScreen> {
                                     ? Image.network(
                                         employee.imageUrl!,
                                         fit: BoxFit.cover,
-                                        errorBuilder: (context, error, stack) => const Icon(Icons.person, size: 72),
+                                        errorBuilder: (context, error, stack) =>
+                                            const Icon(Icons.person, size: 72),
                                       )
                                     : const Icon(Icons.person, size: 72),
                               ),
@@ -132,14 +135,16 @@ class _EmployeeDetailsScreenState extends State<EmployeeDetailsScreen> {
                               Expanded(
                                 child: _detailRow(
                                   'Check-In Time',
-                                  _formatMaybeTime(context, provider.todayCheckInTime),
+                                  _formatMaybeTime(
+                                      context, provider.todayCheckInTime),
                                 ),
                               ),
                               const SizedBox(width: 12),
                               Expanded(
                                 child: _detailRow(
                                   'Check-Out Time',
-                                  _formatMaybeTime(context, provider.todayCheckOutTime),
+                                  _formatMaybeTime(
+                                      context, provider.todayCheckOutTime),
                                 ),
                               ),
                             ],
@@ -162,7 +167,8 @@ Widget _detailRow(String label, String value) {
       children: [
         SizedBox(
           width: 150,
-          child: Text(label, style: const TextStyle(fontWeight: FontWeight.w600)),
+          child:
+              Text(label, style: const TextStyle(fontWeight: FontWeight.w600)),
         ),
         Expanded(
           child: Container(

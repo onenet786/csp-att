@@ -24,7 +24,9 @@ class ApiClient {
     throw ApiException(
       response.statusCode,
       body != null
-          ? (body['error']?.toString() ?? body['message']?.toString() ?? 'GET failed')
+          ? (body['error']?.toString() ??
+              body['message']?.toString() ??
+              'GET failed')
           : 'GET $path failed',
       body,
     );
@@ -49,10 +51,11 @@ class ApiClient {
     throw ApiException(
       response.statusCode,
       err != null
-          ? (err['error']?.toString() ?? err['message']?.toString() ?? 'POST failed')
+          ? (err['error']?.toString() ??
+              err['message']?.toString() ??
+              'POST failed')
           : 'POST $path failed',
       err,
     );
   }
 }
-

@@ -2,7 +2,6 @@ import 'package:employee_attendance/models/attendance_record.dart';
 import 'package:employee_attendance/models/employee.dart';
 import 'package:employee_attendance/services/attendance_api.dart';
 import 'package:flutter/foundation.dart';
-import 'package:employee_attendance/services/api_exception.dart';
 
 class AttendanceProvider extends ChangeNotifier {
   final AttendanceApi api;
@@ -12,55 +11,47 @@ class AttendanceProvider extends ChangeNotifier {
   Employee? currentEmployee;
   bool isSubmitting = false;
   String? errorMessage;
-  int? lastStatusCode;
   DateTime? todayCheckInTime;
   DateTime? todayCheckOutTime;
 
   Future<void> loadEmployee(String code) async {
     errorMessage = null;
-    try {
-      currentEmployee = await api.fetchEmployeeByCode(code);
-    } catch (e) {
-      // Swallow errors; marking can proceed with code only
-      currentEmployee = currentEmployee; // no-op to satisfy lints
-    }
-    try {
-      final times = await api.fetchEmployeeAttendanceTimes(code);
-      final inStr = (times['today']?['inTime'])?.toString();
-      final outStr = (times['today']?['outTime'])?.toString();
-      todayCheckInTime = (inStr != null && inStr.isNotEmpty) ? DateTime.tryParse(inStr) : null;
-      todayCheckOutTime = (outStr != null && outStr.isNotEmpty) ? DateTime.tryParse(outStr) : null;
-    } catch (_) {
-      todayCheckInTime = null;
-      todayCheckOutTime = null;
-    }
+    currentEmployee = await api.fetchEmployeeByCode(code);
     notifyListeners();
   }
 
   Future<bool> submitAttendance(AttendanceRecord record) async {
     isSubmitting = true;
     errorMessage = null;
-    lastStatusCode = null;
     notifyListeners();
     try {
       await api.markAttendance(record);
+      
+      // Update check-in or check-out time based on record type
+      if (record.type == AttendanceType.inScan) {
+        todayCheckInTime = DateTime.now();
+      } else if (record.type == AttendanceType.outScan) {
+        todayCheckOutTime = DateTime.now();
+      }
+      
       return true;
     } catch (e) {
-      if (e is ApiException) {
-        lastStatusCode = e.statusCode;
-        // Prefer backend-provided error message, with status code context
-        final backendMsg = e.body?['error']?.toString() ?? e.body?['message']?.toString();
-        errorMessage = backendMsg != null
-            ? 'Error ${e.statusCode}: $backendMsg'
-            : 'Error ${e.statusCode}: ${e.message}';
-      } else {
-        errorMessage = e.toString();
-      }
+      errorMessage = e.toString();
       return false;
     } finally {
       isSubmitting = false;
       notifyListeners();
     }
+  }
+  
+  void setCheckInTime(DateTime? time) {
+    todayCheckInTime = time;
+    notifyListeners();
+  }
+  
+  void setCheckOutTime(DateTime? time) {
+    todayCheckOutTime = time;
+    notifyListeners();
   }
 }
 
