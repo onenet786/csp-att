@@ -45,6 +45,84 @@ app.get("/health", (req, res) => {
   res.json({ ok: true });
 });
 
+// Debug endpoint to list actual employee codes in the database
+app.get("/debug/employee-codes", async (req, res) => {
+  try {
+    const pool = await getPool();
+    
+    // Get first 10 employee codes to see what's actually in the database
+    const result = await pool.request().query(`
+      SELECT TOP 10 employee_id, employee_code, employee_bar_code, employee_name 
+      FROM employee 
+      ORDER BY employee_id
+    `);
+    
+    res.json({ employees: result.recordset });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Failed to get employee codes", details: e.message });
+  }
+});
+
+// Debug endpoint to check database tables and sample data
+app.get("/debug/tables", async (req, res) => {
+  try {
+    const pool = await getPool();
+    
+    // Get all table names
+    const tablesResult = await pool.request().query(`
+      SELECT TABLE_SCHEMA, TABLE_NAME 
+      FROM INFORMATION_SCHEMA.TABLES 
+      WHERE TABLE_TYPE = 'BASE TABLE'
+      ORDER BY TABLE_SCHEMA, TABLE_NAME
+    `);
+    
+    const tables = {};
+    for (const table of tablesResult.recordset) {
+      const tableName = table.TABLE_NAME;
+      const schema = table.TABLE_SCHEMA;
+      const fullName = `${schema}.${tableName}`;
+      
+      try {
+        // Get column info
+        const columnsResult = await pool.request()
+          .input('schema', sql.NVarChar(128), schema)
+          .input('table', sql.NVarChar(128), tableName)
+          .query(`
+            SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = @schema AND TABLE_NAME = @table
+            ORDER BY ORDINAL_POSITION
+          `);
+        
+        // Get row count
+        const countResult = await pool.request().query(`SELECT COUNT(*) as count FROM [${schema}].[${tableName}]`);
+        const rowCount = countResult.recordset[0].count;
+        
+        // Get sample data for employee-related tables
+        let sampleData = [];
+        if (tableName.toLowerCase().includes('employee') && rowCount > 0) {
+          const sampleResult = await pool.request().query(`SELECT TOP 3 * FROM [${schema}].[${tableName}]`);
+          sampleData = sampleResult.recordset;
+        }
+        
+        tables[fullName] = {
+          columns: columnsResult.recordset,
+          rowCount: rowCount,
+          sampleData: sampleData
+        };
+      } catch (e) {
+        tables[fullName] = { error: e.message };
+      }
+    }
+    
+    res.json({ tables });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Failed to get table info", details: e.message });
+  }
+});
+
 // DB connectivity health check
 app.get("/db/health", async (req, res) => {
   try {
@@ -79,63 +157,115 @@ app.get("/db/leave-types", async (req, res) => {
   }
 });
 
-async function findEmployeeByCode(pool, c) {
-  if (await tableHasName(pool, "Employees")) {
-    const r1 = await pool
-      .request()
-      .input("code", sql.VarChar(50), c)
-      .query(
-        "SELECT TOP 1 Id as id, employee_code as code, Name as name, Designation as designation, Department as department, PhotoUrl as imageUrl FROM Employees WHERE employee_code = @code"
-      );
-    if (r1.recordset?.[0]) return r1.recordset[0];
-    const r2 = await pool
-      .request()
-      .input("code", sql.VarChar(50), c)
-      .query(
-        "SELECT TOP 1 Id as id, Code as code, Name as name, Designation as designation, Department as department, PhotoUrl as imageUrl FROM Employees WHERE Code = @code"
-      );
-    if (r2.recordset?.[0]) return r2.recordset[0];
+// Build candidate code variants to try when resolving employee codes.
+function buildCandidates(code) {
+  const originalCode = String(code || "").trim();
+  const candidates = [originalCode];
+  
+  // Also try the normalized version (without leading non-alphanumeric chars)
+  const normalized = originalCode.replace(/^[^A-Za-z0-9]+/, "");
+  if (normalized && normalized !== originalCode) {
+    candidates.push(normalized);
   }
+  
+  // Try without leading zeros (e.g., '004' -> '4')
+  const noLeadingZeros = normalized.replace(/^0+/, "");
+  if (noLeadingZeros && noLeadingZeros !== normalized) {
+    candidates.push(noLeadingZeros);
+  }
+  
+  // Try numeric id if parseable
+  const asNum = Number(normalized);
+  if (Number.isFinite(asNum) && String(asNum) !== normalized) {
+    candidates.push(String(asNum));
+  }
+  
+  // Also try with leading slash (common pattern in this database)
+  if (!originalCode.startsWith('/') && normalized) {
+    candidates.push('/' + normalized);
+  }
+  
+  return Array.from(new Set(candidates));
+}
+
+// Return an employee object { id, code, name, designation, department, imageUrl } or null
+async function getEmployeeByCode(pool, code) {
+  const candidates = buildCandidates(code);
+  console.log(`Looking for employee with code: ${code}, candidates: ${candidates.join(', ')}`);
+
+  // Try the employee table first (this is what actually exists in the database)
   if (await tableHasName(pool, "employee")) {
     for (const c of candidates) {
-      const r1 = await pool
-        .request()
-        .input("code", sql.VarChar(50), c)
-        .query(
-          "SELECT TOP 1 employee_id as id, employee_code as code, employee_name as name, NULL as designation, NULL as department, employee_image as imageUrl FROM employee WHERE employee_code = @code"
-        );
-      if (r1.recordset?.[0]) return r1.recordset[0];
-      const r2 = await pool
-        .request()
-        .input("code", sql.VarChar(50), c)
-        .query(
-          "SELECT TOP 1 employee_id as id, employee_bar_code as code, employee_name as name, NULL as designation, NULL as department, employee_image as imageUrl FROM employee WHERE employee_bar_code = @code"
-        );
-      if (r2.recordset?.[0]) return r2.recordset[0];
+      console.log(`Trying candidate: ${c} in employee table`);
+      try {
+        // Search by employee_code
+        const r1 = await pool
+          .request()
+          .input("code", sql.VarChar(50), c)
+          .query(
+            "SELECT TOP 1 employee_id as id, employee_code as code, employee_name as name, NULL as designation, NULL as department, employee_image as imageUrl FROM employee WHERE employee_code = @code"
+          );
+        if (r1.recordset?.[0]) {
+          const row = r1.recordset[0];
+          console.log(`Found employee by employee_code: ${JSON.stringify(row)}`);
+          return { id: row.id, code: row.code || c, name: row.name || null, designation: null, department: null, imageUrl: row.imageUrl || null };
+        }
+        
+        // Search by employee_bar_code
+        const r2 = await pool
+          .request()
+          .input("code", sql.VarChar(50), c)
+          .query(
+            "SELECT TOP 1 employee_id as id, employee_bar_code as code, employee_name as name, NULL as designation, NULL as department, employee_image as imageUrl FROM employee WHERE employee_bar_code = @code"
+          );
+        if (r2.recordset?.[0]) {
+          const row = r2.recordset[0];
+          console.log(`Found employee by employee_bar_code: ${JSON.stringify(row)}`);
+          return { id: row.id, code: row.code || c, name: row.name || null, designation: null, department: null, imageUrl: row.imageUrl || null };
+        }
+      } catch (e) {
+        console.error(`Error querying employee table for code ${c}:`, e);
+      }
     }
   }
+
+  // Try Employees table (if it exists)
+  if (await tableHasName(pool, "Employees")) {
+    for (const c of candidates) {
+      try {
+        const r = await pool
+          .request()
+          .input("code", sql.VarChar(50), c)
+          .query(
+            "SELECT TOP 1 Id as id, employee_code as code, Code as altCode, Name as name, Designation as designation, Department as department, PhotoUrl as imageUrl FROM Employees WHERE employee_code = @code OR Code = @code"
+          );
+        if (r.recordset?.[0]) {
+          const row = r.recordset[0];
+          console.log(`Found employee in Employees table: ${JSON.stringify(row)}`);
+          return {
+            id: row.id,
+            code: row.code || row.altCode || c,
+            name: row.name || null,
+            designation: row.designation || null,
+            department: row.department || null,
+            imageUrl: row.imageUrl || null,
+          };
+        }
+      } catch (e) {
+        console.error(`Error querying Employees table for code ${c}:`, e);
+      }
+    }
+  }
+
+  console.log(`No employee found for any candidate of code: ${code}`);
   return null;
 }
 
 async function resolveEmployeeId(pool, code) {
-  const normalized = normalizeCode(code);
   try {
-    // Check if Employees table exists
-    const exists = await pool
-      .request()
-      .input("t", sql.NVarChar(128), "Employees")
-      .query("SELECT 1 AS ok FROM sys.tables WHERE name = @t");
-    if (!exists.recordset?.[0]?.ok) {
-      // Gracefully return null if Employees table isn't present
-      return null;
-    }
-    const result = await pool
-      .request()
-      .input("code", sql.VarChar(50), normalized)
-      .query(
-        "SELECT TOP 1 Code as code, Name as name, Designation as designation, Department as department, PhotoUrl as imageUrl FROM Employees WHERE Code = @code"
-      );
-    return result.recordset[0] || null;
+    // Use the same logic as getEmployeeByCode but just return the ID
+    const employee = await getEmployeeByCode(pool, code);
+    return employee ? employee.id : null;
   } catch (error) {
     console.error("Error resolving employee ID:", error);
     return null;
@@ -148,19 +278,8 @@ app.get("/employees/:code", async (req, res) => {
     const pool = await getPool();
     const code = normalizeCode(req.params.code);
     
-    // Fetch employee info (if available)
-    let employee = null;
-    try {
-      const empRes = await pool
-        .request()
-        .input("code", sql.VarChar(50), code)
-        .query(
-          "SELECT TOP 1 Code as code, Name as name, Designation as designation, Department as department, PhotoUrl as imageUrl FROM Employees WHERE Code = @code"
-        );
-      employee = empRes.recordset?.[0] || null;
-    } catch (_) {
-      employee = null;
-    }
+    // Fetch employee info using the comprehensive lookup function
+    let employee = await getEmployeeByCode(pool, code);
     
     // Process image URL
     let imageUrl = employee?.imageUrl || "";
@@ -175,7 +294,10 @@ app.get("/employees/:code", async (req, res) => {
         imageUrl = `${baseUrl}/${s.replace(/^\/+/, "")}`;
       }
     }
-    res.json({ employee: { ...employee, imageUrl } });
+    
+    // Return the employee with processed imageUrl, or null if not found
+    const result = employee ? { ...employee, imageUrl } : null;
+    res.json({ employee: result });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Failed to fetch employee" });
@@ -715,6 +837,26 @@ app.post("/attendance/insert", async (req, res) => {
     res.status(500).json({ error: "Failed to insert attendance", details: e.message });
   }
 });
+
+// Check if a table with the given name exists in the current database
+async function tableHasName(pool, tableName) {
+  try {
+    const r = await pool
+      .request()
+      .input("t", sql.NVarChar(128), tableName)
+      .query("SELECT 1 AS ok FROM sys.tables WHERE name = @t");
+    return !!(r.recordset?.[0]?.ok);
+  } catch (e) {
+    console.error("tableHasName error:", e);
+    return false;
+  }
+}
+
+// Quote an identifier (schema/table/column) for use in dynamic SQL
+function quoteIdent(name) {
+  if (!name || typeof name !== "string") return name;
+  return "[" + String(name).replace(/]/g, "]]") + "]";
+}
 
 const port = Number(process.env.PORT || 3000);
 app.listen(port, () => console.log(`API listening on :${port}`));
