@@ -3,6 +3,7 @@ class Employee {
   final String name;
   final String? designation;
   final String? department;
+  final String? employeeSubGroupName;
   final String? imageUrl;
 
   const Employee({
@@ -10,6 +11,7 @@ class Employee {
     required this.name,
     this.designation,
     this.department,
+    this.employeeSubGroupName,
     this.imageUrl,
   });
 
@@ -19,8 +21,23 @@ class Employee {
       name: json['name']?.toString() ?? '',
       designation: json['designation']?.toString(),
       department: json['department']?.toString(),
+      employeeSubGroupName: json['employee_sub_group_name']?.toString() ??
+          json['employeeSubGroupName']?.toString(),
       imageUrl: json['imageUrl']?.toString(),
     );
   }
-}
 
+  String get displayDepartment {
+    if (employeeSubGroupName != null &&
+        employeeSubGroupName!.trim().isNotEmpty &&
+        employeeSubGroupName != '-') {
+      return employeeSubGroupName!;
+    }
+    if (department != null &&
+        department!.trim().isNotEmpty &&
+        department != '-') {
+      return department!;
+    }
+    return '';
+  }
+}

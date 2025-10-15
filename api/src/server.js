@@ -5,6 +5,14 @@ import sql from "mssql";
 
 dotenv.config();
 
+// Global error handlers to capture unexpected crashes during development
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err && err.stack ? err.stack : err);
+});
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled rejection at:', promise, 'reason:', reason && reason.stack ? reason.stack : reason);
+});
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -61,6 +69,97 @@ app.get("/debug/employee-codes", async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Failed to get employee codes", details: e.message });
+  }
+});
+
+// Debug: fetch full employee row by id (development helper)
+app.get('/debug/employee/:id', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: 'Invalid id' });
+  try {
+    const pool = await getPool();
+    const r = await pool.request().input('id', sql.Int, id).query('SELECT TOP 1 * FROM employee WHERE employee_id = @id');
+    return res.json({ row: r.recordset?.[0] || null });
+  } catch (e) {
+    console.error('debug employee error', e);
+    res.status(500).json({ error: 'DB error', details: e.message });
+  }
+});
+
+// Debug: show joined values (designation, cost_centre, branch) for an employee id
+app.get('/debug/employee-joins/:id', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: 'Invalid id' });
+  try {
+    const pool = await getPool();
+    const q = `SELECT TOP 1 
+      e.employee_id AS id, 
+      e.employee_code, 
+      e.employee_bar_code, 
+      e.employee_name, 
+      e.designation_id, 
+      e.cost_centre_id, 
+      e.branch_id, 
+      k.employee_sub_group_name, 
+      d.designation_name, 
+      cc.cost_centre_name, 
+      b.branch_name 
+    FROM employee e 
+    LEFT JOIN designation d ON e.designation_id = d.designation_id 
+    LEFT JOIN cost_centre cc ON e.cost_centre_id = cc.cost_centre_id 
+    LEFT JOIN employee_sub_group k ON e.employee_sub_group_id = k.employee_sub_group_id 
+    LEFT JOIN branch b ON e.branch_id = b.branch_id 
+    WHERE e.employee_id = @id`;
+    const r = await pool.request().input('id', sql.Int, id).query(q);
+    const row = r.recordset?.[0] || null;
+
+    // Also fetch the referenced designation/cost_centre/branch rows directly to compare
+    const refs = {};
+    if (row) {
+
+// Temporary debug: lookup employee_sub_group by id using the helper
+app.get('/debug/employee-sub-group/:id', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: 'Invalid id' });
+  try {
+    const pool = await getPool();
+    const s = await lookupEmployeeSubGroup(pool, id);
+    res.json({ id, result: s });
+  } catch (e) {
+    console.error('debug employee-sub-group error', e);
+    res.status(500).json({ error: 'DB error', details: e.message });
+  }
+});
+      if (row.designation_id != null) {
+        try {
+          const rd = await pool.request().input('did', sql.Int, row.designation_id).query('SELECT * FROM designation WHERE designation_id = @did');
+          refs.designation = rd.recordset || [];
+        } catch (e) {
+          refs.designationError = e.message;
+        }
+      }
+      if (row.cost_centre_id != null) {
+        try {
+          const rc = await pool.request().input('ccid', sql.Int, row.cost_centre_id).query('SELECT * FROM cost_centre WHERE cost_centre_id = @ccid');
+          refs.cost_centre = rc.recordset || [];
+        } catch (e) {
+          refs.costCentreError = e.message;
+        }
+      }
+      if (row.branch_id != null) {
+        try {
+          const rb = await pool.request().input('bid', sql.Int, row.branch_id).query('SELECT * FROM branch WHERE branch_id = @bid');
+          refs.branch = rb.recordset || [];
+        } catch (e) {
+          refs.branchError = e.message;
+        }
+      }
+    }
+
+    res.json({ joined: row, refs });
+  } catch (e) {
+    console.error('debug employee joins error', e);
+    res.status(500).json({ error: 'DB error', details: e.message });
   }
 });
 
@@ -148,7 +247,12 @@ app.get("/db/leave-types", async (req, res) => {
     const rows = result.recordset || [];
     console.log(`Fetched ${rows.length} rows from leave_type`);
     if (rows.length) {
-      console.log("Sample rows:", rows.slice(0, Math.min(5, rows.length)));
+      // Don't print full row objects (may contain binary buffers). Log a safe summary instead.
+      const sample = rows.slice(0, Math.min(5, rows.length)).map((r) => {
+        const keys = Object.keys(r || {});
+        return { keys, hasBinary: keys.some((k) => Buffer.isBuffer(r[k])) };
+      });
+      console.log('Sample rows metadata:', sample);
     }
     res.json({ rows });
   } catch (error) {
@@ -188,6 +292,53 @@ function buildCandidates(code) {
   return Array.from(new Set(candidates));
 }
 
+// Robust helper: try several likely employee_sub_group table/column name variants
+// to resolve a sub-group id -> { department, name, sub_group_name } or null.
+async function lookupEmployeeSubGroup(pool, esgId) {
+  if (esgId == null) return null;
+  const tableCandidates = [
+    { schema: 'dbo', table: 'employee_sub_group' },
+    { schema: 'dbo', table: 'employee_subgroup' },
+    { schema: 'dbo', table: 'employee_sub_groups' },
+    { schema: null, table: 'employee_sub_group' },
+    { schema: null, table: 'employee_subgroup' },
+  ];
+  const colCandidates = ['employee_sub_group_id', 'employee_subgroup_id', 'id', 'sub_group_id'];
+  const nameCandidates = ['employee_sub_group_name', 'sub_group_name', 'name', 'department'];
+
+  for (const t of tableCandidates) {
+    const fullName = t.schema ? `${quoteIdent(t.schema)}.${quoteIdent(t.table)}` : quoteIdent(t.table);
+    for (const col of colCandidates) {
+      const q = `SELECT TOP 1 ${nameCandidates.map((n) => quoteIdent(n)).join(', ')} FROM ${fullName} WHERE ${quoteIdent(col)} = @esg`;
+      try {
+        const r = await pool.request().input('esg', sql.Int, esgId).query(q);
+        const found = r.recordset?.[0];
+        if (found) {
+          // Normalize to keys we expect
+          return {
+            department: found.department || null,
+            name: found.name || null,
+            sub_group_name: found.sub_group_name || null,
+            employee_sub_group_name: found.employee_sub_group_name || null,
+          };
+        }
+      } catch (e) {
+        // ignore and try next candidate
+      }
+    }
+  }
+  return null;
+}
+
+function isMissingDepartment(val) {
+  if (val == null) return true;
+  if (typeof val === 'string') {
+    const s = val.trim();
+    if (s === '' || s === '-') return true;
+  }
+  return false;
+}
+
 // Return an employee object { id, code, name, designation, department, imageUrl } or null
 async function getEmployeeByCode(pool, code) {
   const candidates = buildCandidates(code);
@@ -198,30 +349,201 @@ async function getEmployeeByCode(pool, code) {
     for (const c of candidates) {
       console.log(`Trying candidate: ${c} in employee table`);
       try {
-        // Search by employee_code
+        // Search by employee_code (include designation and department via joins)
         const r1 = await pool
           .request()
           .input("code", sql.VarChar(50), c)
           .query(
-            "SELECT TOP 1 employee_id as id, employee_code as code, employee_name as name, NULL as designation, NULL as department, employee_image as imageUrl FROM employee WHERE employee_code = @code"
+  "SELECT TOP 1 e.employee_id AS id, e.employee_code AS code, e.employee_name AS name, e.designation_id, e.cost_centre_id, e.branch_id, e.employee_sub_group_id, k.employee_sub_group_name AS employee_sub_group_name, d.designation_name AS designation, COALESCE(k.employee_sub_group_name, cc.cost_centre_name, b.branch_name) AS department, e.employee_image AS imageUrl FROM employee e LEFT JOIN designation d ON e.designation_id = d.designation_id LEFT JOIN cost_centre cc ON e.cost_centre_id = cc.cost_centre_id LEFT JOIN employee_sub_group k ON e.employee_sub_group_id = k.employee_sub_group_id LEFT JOIN branch b ON e.branch_id = b.branch_id WHERE e.employee_code = @code"
           );
         if (r1.recordset?.[0]) {
           const row = r1.recordset[0];
-          console.log(`Found employee by employee_code: ${JSON.stringify(row)}`);
-          return { id: row.id, code: row.code || c, name: row.name || null, designation: null, department: null, imageUrl: row.imageUrl || null };
+          // Avoid logging raw row which may contain binary buffers (employee_image).
+          const safeRow = { id: row.id, code: row.code, name: row.name, designation: row.designation, department: row.department };
+          console.log('Found employee by employee_code:', safeRow);
+          // If designation/department are missing, try direct lookups by id first
+            try {
+            if ((row.designation == null || isMissingDepartment(row.department)) ) {
+              // Try designation by designation_id
+              if (row.designation == null && row.designation_id != null) {
+                try {
+                  const rd = await pool.request().input('did', sql.Int, row.designation_id).query('SELECT TOP 1 designation_name FROM designation WHERE designation_id = @did');
+                  const dn = rd.recordset?.[0]?.designation_name;
+                  if (dn) row.designation = dn;
+                } catch (e) {
+                  console.error('designation lookup failed', e);
+                }
+              }
+              // Try cost_centre by cost_centre_id
+              if (isMissingDepartment(row.department) && row.cost_centre_id != null) {
+                try {
+                  const rc = await pool.request().input('ccid', sql.Int, row.cost_centre_id).query('SELECT TOP 1 cost_centre_name FROM cost_centre WHERE cost_centre_id = @ccid');
+                  const cn = rc.recordset?.[0]?.cost_centre_name;
+                  if (cn) row.department = cn;
+                } catch (e) {
+                  console.error('cost_centre lookup failed', e);
+                }
+              }
+              // Try branch by branch_id
+              if (isMissingDepartment(row.department) && row.branch_id != null) {
+                try {
+                  const rb = await pool.request().input('bid', sql.Int, row.branch_id).query('SELECT TOP 1 branch_name FROM branch WHERE branch_id = @bid');
+                  const bn = rb.recordset?.[0]?.branch_name;
+                  if (bn) row.department = bn;
+                } catch (e) {
+                  console.error('branch lookup failed', e);
+                }
+              }
+            }
+
+            // Extra fallback: check employee_group (some DBs store department there)
+            if (isMissingDepartment(row.department)) {
+              try {
+                // Try several likely column names in employee_group
+                const colCandidates = ['department', 'dept', 'name'];
+                let gdept = null;
+                for (const col of colCandidates) {
+                  try {
+                    const q = `SELECT TOP 1 ${quoteIdent(col)} AS dept FROM employee_group WHERE employee_id = @empId`;
+                    const eg = await pool.request().input('empId', sql.Int, row.id).query(q);
+                    if (eg.recordset?.[0]?.dept) {
+                      gdept = eg.recordset[0].dept; break;
+                    }
+                  } catch (_) {
+                    // ignore and try next column
+                  }
+                }
+                if (gdept) row.department = gdept;
+              } catch (e) {
+                console.error('employee_group lookup failed', e.message || e);
+              }
+            }
+
+            // New fallback: use employee_sub_group via employee_sub_group_id (some schemas store sub-group info)
+            if (isMissingDepartment(row.department) && row.employee_sub_group_id != null) {
+              try {
+                const s = await lookupEmployeeSubGroup(pool, row.employee_sub_group_id);
+                if (s) {
+                  row.department = row.department || s.department || s.name || s.sub_group_name || null;
+                }
+              } catch (e) {
+                console.error('employee_sub_group lookup failed', e.message || e);
+              }
+            }
+
+            // Extra fallback: check employee_group for department
+            if (isMissingDepartment(row.department)) {
+              try {
+                const colCandidates = ['department', 'dept', 'name'];
+                let gdept = null;
+                for (const col of colCandidates) {
+                  try {
+                    const q = `SELECT TOP 1 ${quoteIdent(col)} AS dept FROM employee_group WHERE employee_id = @empId`;
+                    const eg = await pool.request().input('empId', sql.Int, row.id).query(q);
+                    if (eg.recordset?.[0]?.dept) {
+                      gdept = eg.recordset[0].dept; break;
+                    }
+                  } catch (_) {}
+                }
+                if (gdept) row.department = gdept;
+              } catch (e) {
+                console.error('employee_group lookup failed', e.message || e);
+              }
+            }
+
+            // Still missing or image missing: try Employees fallback table if present
+            if ((row.designation == null || row.department == null || row.imageUrl == null) && (await tableHasName(pool, "Employees"))) {
+              const fb = await pool
+                .request()
+                .input("id", sql.Int, row.id)
+                .input("code", sql.VarChar(50), row.code || c)
+                .query(
+                  "SELECT TOP 1 Designation AS designation, Department AS department, PhotoUrl AS photoUrl FROM Employees WHERE Id = @id OR employee_code = @code OR Code = @code"
+                );
+              const f = fb.recordset?.[0];
+              if (f) {
+                row.designation = row.designation || f.designation || null;
+                row.department = row.department || f.department || null;
+                row.imageUrl = row.imageUrl || f.photoUrl || null;
+              }
+            }
+            // employee_sub_group fallback for employee_bar_code path
+            if (isMissingDepartment(row.department) && row.employee_sub_group_id != null) {
+              try {
+                const s = await lookupEmployeeSubGroup(pool, row.employee_sub_group_id);
+                if (s) {
+                  row.department = row.department || s.department || s.name || s.sub_group_name || null;
+                }
+              } catch (e) {
+                console.error('employee_sub_group lookup failed', e.message || e);
+              }
+            }
+          } catch (e) {
+            console.error('Fallback lookup failed', e);
+          }
+          return { id: row.id, code: row.code || c, name: row.name || null, designation: row.designation || null, department: row.department || null, employee_sub_group_name: row.employee_sub_group_name || null, imageUrl: row.imageUrl || null };
         }
         
-        // Search by employee_bar_code
+        // Search by employee_bar_code (include designation and department via joins)
         const r2 = await pool
           .request()
           .input("code", sql.VarChar(50), c)
           .query(
-            "SELECT TOP 1 employee_id as id, employee_bar_code as code, employee_name as name, NULL as designation, NULL as department, employee_image as imageUrl FROM employee WHERE employee_bar_code = @code"
+            "SELECT TOP 1 e.employee_id AS id, e.employee_bar_code AS code, e.employee_name AS name, e.designation_id, e.cost_centre_id, e.branch_id, e.employee_sub_group_id, k.employee_sub_group_name AS employee_sub_group_name, d.designation_name AS designation, COALESCE(k.employee_sub_group_name, cc.cost_centre_name, b.branch_name) AS department, e.employee_image AS imageUrl FROM employee e LEFT JOIN designation d ON e.designation_id = d.designation_id LEFT JOIN cost_centre cc ON e.cost_centre_id = cc.cost_centre_id LEFT JOIN employee_sub_group k ON e.employee_sub_group_id = k.employee_sub_group_id LEFT JOIN branch b ON e.branch_id = b.branch_id WHERE e.employee_bar_code = @code"
           );
         if (r2.recordset?.[0]) {
           const row = r2.recordset[0];
-          console.log(`Found employee by employee_bar_code: ${JSON.stringify(row)}`);
-          return { id: row.id, code: row.code || c, name: row.name || null, designation: null, department: null, imageUrl: row.imageUrl || null };
+          const safeRow = { id: row.id, code: row.code, name: row.name, designation: row.designation, department: row.department };
+          console.log('Found employee by employee_bar_code:', safeRow);
+          try {
+            if ((row.designation == null || row.department == null) ) {
+              if (row.designation == null && row.designation_id != null) {
+                try {
+                  const rd = await pool.request().input('did', sql.Int, row.designation_id).query('SELECT TOP 1 designation_name FROM designation WHERE designation_id = @did');
+                  const dn = rd.recordset?.[0]?.designation_name;
+                  if (dn) row.designation = dn;
+                } catch (e) {
+                  console.error('designation lookup failed', e);
+                }
+              }
+              if (row.department == null && row.cost_centre_id != null) {
+                try {
+                  const rc = await pool.request().input('ccid', sql.Int, row.cost_centre_id).query('SELECT TOP 1 cost_centre_name FROM cost_centre WHERE cost_centre_id = @ccid');
+                  const cn = rc.recordset?.[0]?.cost_centre_name;
+                  if (cn) row.department = cn;
+                } catch (e) {
+                  console.error('cost_centre lookup failed', e);
+                }
+              }
+              if (row.department == null && row.branch_id != null) {
+                try {
+                  const rb = await pool.request().input('bid', sql.Int, row.branch_id).query('SELECT TOP 1 branch_name FROM branch WHERE branch_id = @bid');
+                  const bn = rb.recordset?.[0]?.branch_name;
+                  if (bn) row.department = bn;
+                } catch (e) {
+                  console.error('branch lookup failed', e);
+                }
+              }
+            }
+            if ((row.designation == null || row.department == null || row.imageUrl == null) && (await tableHasName(pool, "Employees"))) {
+              const fb = await pool
+                .request()
+                .input("id", sql.Int, row.id)
+                .input("code", sql.VarChar(50), row.code || c)
+                .query(
+                  "SELECT TOP 1 Designation AS designation, Department AS department, PhotoUrl AS photoUrl FROM Employees WHERE Id = @id OR employee_code = @code OR Code = @code"
+                );
+              const f = fb.recordset?.[0];
+              if (f) {
+                row.designation = row.designation || f.designation || null;
+                row.department = row.department || f.department || null;
+                row.imageUrl = row.imageUrl || f.photoUrl || null;
+              }
+            }
+          } catch (e) {
+            console.error('Fallback lookup failed', e);
+          }
+          return { id: row.id, code: row.code || c, name: row.name || null, designation: row.designation || null, department: row.department || null, employee_sub_group_name: row.employee_sub_group_name || null, imageUrl: row.imageUrl || null };
         }
       } catch (e) {
         console.error(`Error querying employee table for code ${c}:`, e);
@@ -241,7 +563,8 @@ async function getEmployeeByCode(pool, code) {
           );
         if (r.recordset?.[0]) {
           const row = r.recordset[0];
-          console.log(`Found employee in Employees table: ${JSON.stringify(row)}`);
+          const safeRow = { id: row.id, code: row.code || row.altCode, name: row.name, designation: row.designation, department: row.department };
+          console.log('Found employee in Employees table:', safeRow);
           return {
             id: row.id,
             code: row.code || row.altCode || c,
@@ -859,4 +1182,7 @@ function quoteIdent(name) {
 }
 
 const port = Number(process.env.PORT || 3000);
-app.listen(port, () => console.log(`API listening on :${port}`));
+app.listen(port, () => {
+  // Keep startup log minimal to avoid accidental formatting of large objects
+  console.log('API listening on port', port);
+});

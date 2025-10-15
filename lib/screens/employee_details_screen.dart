@@ -107,7 +107,7 @@ class _EmployeeDetailsScreenState extends State<EmployeeDetailsScreen> {
                                     _detailRow('Designation',
                                         employee.designation ?? ''),
                                     _detailRow('Department',
-                                        employee.department ?? ''),
+                                        employee.displayDepartment),
                                   ],
                                 ),
                               ),

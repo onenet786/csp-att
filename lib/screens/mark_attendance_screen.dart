@@ -21,21 +21,23 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
   );
   final TextEditingController _codeController = TextEditingController();
   final FocusNode _hotkeyFocus = FocusNode(debugLabel: 'hotkey_focus');
+  final FocusNode _codeFocus = FocusNode(debugLabel: 'code_focus');
   final List<AttendanceRecord> _recentMarks = <AttendanceRecord>[];
   Timer? _clockTimer;
   DateTime _now = DateTime.now();
   AttendanceType? _lastType;
-  Timer? _searchDebounce;
-  String _lastLoadedCode = '';
+  // Auto-load disabled: no debounce or last-loaded code tracking needed
   String? _selectedReason;
+  // Local processing flag to disable inputs while Enter flow runs
+  bool _isProcessing = false;
 
   @override
   void dispose() {
     _tabController.dispose();
     _codeController.dispose();
     _hotkeyFocus.dispose();
+    _codeFocus.dispose();
     _clockTimer?.cancel();
-    _searchDebounce?.cancel();
     super.dispose();
   }
 
@@ -84,14 +86,17 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
     }
 
     // Reason handling: require for checkout (Out)
-    final providedReason = (reason ?? (type == AttendanceType.outScan ? '' : 'Duty')).trim();
+    final providedReason =
+        (reason ?? (type == AttendanceType.outScan ? '' : 'Duty')).trim();
     setState(() {
       _selectedReason = providedReason.isEmpty ? null : providedReason;
     });
     if (type == AttendanceType.outScan && providedReason.isEmpty) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Checkout requires reason. Use hotkeys 1..9,0,+,-')),
+          const SnackBar(
+              content:
+                  Text('Checkout requires reason. Use hotkeys 1..9,0,+,-')),
         );
       }
       return false;
@@ -122,9 +127,10 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
     if (type == AttendanceType.inScan) {
       if (!mounted) return false;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(provider.errorMessage == null
-            ? 'Check-In failed. Select a reason to check-out'
-            : '${provider.errorMessage}. Select a reason to check-out')),
+        SnackBar(
+            content: Text(provider.errorMessage == null
+                ? 'Check-In failed. Select a reason to check-out'
+                : '${provider.errorMessage}. Select a reason to check-out')),
       );
       final picked = await _showReasonPicker();
       if (!mounted) return false;
@@ -134,11 +140,14 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
           _selectedReason = chosen;
         });
         // Submit checkout with selected reason
-        return _handleSubmit(trimmedCode, AttendanceType.outScan, reason: chosen);
+        return _handleSubmit(trimmedCode, AttendanceType.outScan,
+            reason: chosen);
       } else {
         if (!mounted) return false;
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Checkout requires reason. Use hotkeys 1..9,0,+,-')),
+          const SnackBar(
+              content:
+                  Text('Checkout requires reason. Use hotkeys 1..9,0,+,-')),
         );
         return false;
       }
@@ -159,7 +168,8 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
     if (trimmed.isEmpty) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Please enter employee code to load info')),
+          const SnackBar(
+              content: Text('Please enter employee code to load info')),
         );
       }
       return;
@@ -169,7 +179,9 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
     if (!mounted) return;
     final found = provider.currentEmployee != null;
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(found ? 'Employee info loaded' : 'No employee details found')),
+      SnackBar(
+          content: Text(
+              found ? 'Employee info loaded' : 'No employee details found')),
     );
 
     // After loading info, check current status and auto-show reason picker if already IN
@@ -189,7 +201,9 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
         } else {
           if (!mounted) return;
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Checkout requires reason. Use hotkeys 1..9,0,+,-')),
+            const SnackBar(
+                content:
+                    Text('Checkout requires reason. Use hotkeys 1..9,0,+,-')),
           );
         }
       }
@@ -198,26 +212,10 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
     }
   }
 
-  void _onCodeChanged(String value) {
-    final trimmed = value.trim();
-    _searchDebounce?.cancel();
-    if (trimmed.isEmpty) return;
-    _searchDebounce = Timer(const Duration(milliseconds: 400), () {
-      if (!mounted) return;
-      if (trimmed == _lastLoadedCode) return;
-      _autoLoadInfo(trimmed);
-    });
-  }
-
-  Future<void> _autoLoadInfo(String code) async {
-    final provider = context.read<AttendanceProvider>();
-    await provider.loadEmployee(code);
-    if (!mounted) return;
-    _lastLoadedCode = code;
-    setState(() {});
-  }
+  // Auto-load disabled: user must press "Load Info" or Check-In/Out.
 
   Future<String?> _showReasonPicker() async {
+    // Button-style bottom sheet for quick selection (used on Enter and Checkout)
     const reasons = [
       'Personal',
       'Tea',
@@ -232,28 +230,112 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
       'Dinner',
       'Rest',
     ];
-    return showDialog<String>(
+    return showModalBottomSheet<String>(
       context: context,
       builder: (ctx) {
-        return SimpleDialog(
-          title: const Text('Select checkout reason'),
-          children: [
-            for (final r in reasons)
-              SimpleDialogOption(
-                onPressed: () => Navigator.of(ctx).pop(r),
-                child: Text(r),
+        return Padding(
+          padding: const EdgeInsets.all(12),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const Text('Select checkout reason',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  for (final r in reasons)
+                    ElevatedButton(
+                      onPressed: () => Navigator.of(ctx).pop(r),
+                      child: Text(r),
+                    ),
+                ],
               ),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              child: Text(
+              const SizedBox(height: 8),
+              Text(
                 'Tip: You can also use keyboard hotkeys 1..9, 0, +, -',
                 style: Theme.of(context).textTheme.bodySmall,
+                textAlign: TextAlign.center,
               ),
-            ),
-          ],
+              const SizedBox(height: 8),
+            ],
+          ),
         );
       },
     );
+  }
+
+  Future<void> _onEnterPressed(String code) async {
+    final trimmed = code.trim();
+    if (trimmed.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Please enter employee code')),
+        );
+      }
+      return;
+    }
+
+    final provider = context.read<AttendanceProvider>();
+    // Local guard to prevent duplicate Enter processing
+    if (_isProcessing) return;
+    setState(() {
+      _isProcessing = true;
+    });
+    // Load employee info for UI
+    await provider.loadEmployee(trimmed);
+
+    try {
+      final api = provider.api;
+      final statusRes = await api.fetchStatusByCode(trimmed);
+      final status = (statusRes['status'] ?? '').toString().toUpperCase();
+      final latestReason = (statusRes['reason'] ?? '').toString();
+      final latestTs = statusRes['timestamp'] != null
+          ? DateTime.tryParse(statusRes['timestamp'].toString())
+          : null;
+
+      // If last checkout reason is day off/duty off for today, prevent marking
+      final lowerReason = latestReason.toLowerCase();
+      final isDutyOrDayOff =
+          lowerReason == 'duty off' || lowerReason == 'day off';
+      final sameDay = latestTs != null &&
+          latestTs.toLocal().year == DateTime.now().year &&
+          latestTs.toLocal().month == DateTime.now().month &&
+          latestTs.toLocal().day == DateTime.now().day;
+      if (isDutyOrDayOff && sameDay) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+                content: Text(
+                    "Cannot mark attendance: last checkout reason is 'day off' for today")),
+          );
+        }
+        return;
+      }
+
+      if (status != 'IN') {
+        // Not checked-in -> perform check-in
+        await _handleSubmit(trimmed, AttendanceType.inScan);
+      } else {
+        // Already checked-in -> request reason (button UI) and perform checkout
+        final picked = await _showReasonPicker();
+        if (picked == null || picked.trim().isEmpty) return;
+        await _handleSubmit(trimmed, AttendanceType.outScan,
+            reason: picked.trim());
+      }
+    } catch (e) {
+      // On errors, fallback to simple load info behavior
+      await _loadInfo(trimmed);
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isProcessing = false;
+        });
+      }
+    }
   }
 
   String? _reasonFromKey(KeyEvent e) {
@@ -277,16 +359,21 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
       return map[ch];
     }
     final key = e.logicalKey;
-    if (key == LogicalKeyboardKey.numpadAdd || key == LogicalKeyboardKey.equal) {
+    if (key == LogicalKeyboardKey.numpadAdd ||
+        key == LogicalKeyboardKey.equal) {
       return 'Iftar';
     }
-    if (key == LogicalKeyboardKey.numpadSubtract || key == LogicalKeyboardKey.minus) {
+    if (key == LogicalKeyboardKey.numpadSubtract ||
+        key == LogicalKeyboardKey.minus) {
       return 'Rest';
     }
     return null;
   }
 
   void _onKeyEvent(KeyEvent e) {
+    // Ignore hotkey events while user is typing into the code field.
+    // Use both hasFocus and hasPrimaryFocus to be robust across platforms.
+    if (_codeFocus.hasFocus || _codeFocus.hasPrimaryFocus) return;
     final reason = _reasonFromKey(e);
     if (reason != null) {
       final code = _codeController.text.trim();
@@ -302,9 +389,6 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
       _handleSubmit(code, AttendanceType.outScan, reason: reason);
     }
   }
-
-
-  
 
   @override
   Widget build(BuildContext context) {
@@ -343,254 +427,246 @@ class _MarkAttendanceScreenState extends State<MarkAttendanceScreen>
         autofocus: true,
         onKeyEvent: _onKeyEvent,
         child: Stack(
-        children: [
-          Padding(
-            padding: const EdgeInsets.all(12),
-            child: Column(
-              children: [
-                Row(
-                  children: [
-                    Expanded(
-                      child: Row(
-                        children: [
-                          Expanded(
-                            child: TextField(
-                              controller: _codeController,
-                              decoration: const InputDecoration(
-                                labelText: 'Enter Employee Code',
-                                border: OutlineInputBorder(),
-                              ),
-                              onChanged: _onCodeChanged,
-                              onSubmitted: (_) => _loadInfo(
-                                _codeController.text.trim(),
-                              ),
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          OutlinedButton(
-                            onPressed: () => _loadInfo(_codeController.text.trim()),
-                            child: const Text('Load Info'),
-                          ),
-                          const SizedBox(width: 8),
-                          ElevatedButton(
-                            onPressed: () => _handleSubmit(
-                              _codeController.text.trim(),
-                              AttendanceType.inScan,
-                            ),
-                            child: const Text('Check-In'),
-                          ),
-                          const SizedBox(width: 8),
-                          ElevatedButton(
-                            onPressed: () async {
-                              final code = _codeController.text.trim();
-                              if (code.isEmpty) {
-                                ScaffoldMessenger.of(context).showSnackBar(
-                                  const SnackBar(content: Text('Enter employee code before checkout')),
-                                );
-                                return;
-                              }
-                              final reason = await _showReasonPicker();
-                              if (reason == null || reason.trim().isEmpty) return;
-                              setState(() {
-                                _selectedReason = reason.trim();
-                              });
-                              await _handleSubmit(code, AttendanceType.outScan, reason: reason.trim());
-                            },
-                            child: const Text('Check-Out'),
-                          ),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(width: 16),
-                    Expanded(
-                      child: Text(
-                        'Attendance Marked',
-                        style: Theme.of(context)
-                            .textTheme
-                            .titleLarge
-                            ?.copyWith(color: Colors.green[700]),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                Expanded(
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                children: [
+                  Row(
                     children: [
-                      // Left grid
                       Expanded(
-                        child: Container(
-                          decoration: BoxDecoration(
-                            border: Border.all(color: Colors.grey.shade400),
-                          ),
-                          child: SingleChildScrollView(
-                            scrollDirection: Axis.horizontal,
-                            child: SingleChildScrollView(
-                              child: DataTable(
-                              columns: const [
-                                DataColumn(label: Text('Time')),
-                                DataColumn(label: Text('Reason')),
-                                DataColumn(label: Text('Type')),
-                                DataColumn(label: Text('Duration')),
-                                DataColumn(label: Text('Allowed')),
-                                DataColumn(label: Text('Remarks')),
-                              ],
-                              rows: _recentMarks
-                                  .map(
-                                    (r) => DataRow(cells: [
-                                      DataCell(Text(
-                                          TimeOfDay.fromDateTime(r.timestamp)
-                                              .format(context))),
-                                      DataCell(Text(r.reason)),
-                                      DataCell(Text(
-                                          r.type == AttendanceType.inScan
-                                              ? 'In'
-                                              : 'Out')),
-                                      const DataCell(Text('0:0')),
-                                      const DataCell(Text('0:0')),
-                                      DataCell(Text(r.remarks ?? '')),
-                                    ]),
-                                  )
-                                  .toList(),
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: TextField(
+                                controller: _codeController,
+                                focusNode: _codeFocus,
+                                enabled: !_isProcessing,
+                                decoration: const InputDecoration(
+                                  labelText: 'Enter Employee Code',
+                                  border: OutlineInputBorder(),
+                                ),
+                                onSubmitted: (v) => _onEnterPressed(v),
                               ),
                             ),
-                          ),
+                            const SizedBox(width: 8),
+                            OutlinedButton(
+                              onPressed: _isProcessing
+                                  ? null
+                                  : () =>
+                                      _loadInfo(_codeController.text.trim()),
+                              child: const Text('Load Info'),
+                            ),
+                            // Check-In and Check-Out buttons intentionally hidden - Enter or Load Info drives the flow
+                          ],
                         ),
                       ),
                       const SizedBox(width: 16),
-                      // Right panel
-                      Flexible(
-                        flex: 1,
-                        child: ConstrainedBox(
-                          constraints: const BoxConstraints(maxWidth: 380),
-                          child: SingleChildScrollView(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            _buildDetailRow(
-                                'Employee Code', employee?.code ?? ''),
-                            _buildDetailRow(
-                                'Employee Name', employee?.name ?? ''),
-                            _buildDetailRow('Designation Name',
-                                employee?.designation ?? ''),
-                            _buildDetailRow('Branch Name', ''),
-                            _buildDetailRow(
-                                'Group Name', employee?.department ?? ''),
-                            const SizedBox(height: 8),
-                            _buildDetailRow(
-                                'Today Check-In',
-                                _formatMaybeTime(context, context.watch<AttendanceProvider>().todayCheckInTime)),
-                            _buildDetailRow(
-                                'Today Check-Out',
-                                _formatMaybeTime(context, context.watch<AttendanceProvider>().todayCheckOutTime)),
-                            const SizedBox(height: 8),
-                            Row(
-                              children: [
-                                Expanded(
-                                  child: Center(
-                                    child: Text(
-                                      _lastType == AttendanceType.outScan
-                                          ? 'OUT'
-                                          : 'IN',
-                                      style: TextStyle(
-                                        color:
-                                            _lastType == AttendanceType.outScan
-                                                ? Colors.red
-                                                : Colors.green,
-                                        fontSize: 48,
-                                        fontWeight: FontWeight.bold,
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                                Container(
-                                  width: 130,
-                                  height: 130,
-                                  color: Colors.grey.shade300,
-                                  child: employee?.imageUrl != null
-                                      ? Image.network(
-                                          employee!.imageUrl!,
-                                          fit: BoxFit.cover,
-                                          errorBuilder: (context, error, stack) => const Icon(Icons.person, size: 64),
-                                        )
-                                      : const Icon(Icons.person, size: 64),
-                                ),
-                              ],
+                      Expanded(
+                        child: Text(
+                          'Attendance Marked',
+                          style: Theme.of(context)
+                              .textTheme
+                              .titleLarge
+                              ?.copyWith(color: Colors.green[700]),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Expanded(
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        // Left grid
+                        Expanded(
+                          child: Container(
+                            decoration: BoxDecoration(
+                              border: Border.all(color: Colors.grey.shade400),
                             ),
-                            const SizedBox(height: 8),
-                            _buildDetailRow('Selected Reason', _selectedReason ?? ''),
-                            const SizedBox(height: 16),
-                            Text(
-                              _formatLongDate(_now),
-                              style: Theme.of(context).textTheme.titleLarge,
-                            ),
-                            Text(
-                              TimeOfDay.fromDateTime(_now).format(context),
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .headlineMedium
-                                  ?.copyWith(fontWeight: FontWeight.bold),
-                            ),
-                            const SizedBox(height: 12),
-                            Row(
-                              children: [
-                                ElevatedButton(
-                                  onPressed: () => Navigator.maybePop(context),
-                                  child: const Text('Close'),
+                            child: SingleChildScrollView(
+                              scrollDirection: Axis.horizontal,
+                              child: SingleChildScrollView(
+                                child: DataTable(
+                                  columns: const [
+                                    DataColumn(label: Text('Time')),
+                                    DataColumn(label: Text('Reason')),
+                                    DataColumn(label: Text('Type')),
+                                    DataColumn(label: Text('Duration')),
+                                    DataColumn(label: Text('Allowed')),
+                                    DataColumn(label: Text('Remarks')),
+                                  ],
+                                  rows: _recentMarks
+                                      .map(
+                                        (r) => DataRow(cells: [
+                                          DataCell(Text(TimeOfDay.fromDateTime(
+                                                  r.timestamp)
+                                              .format(context))),
+                                          DataCell(Text(r.reason)),
+                                          DataCell(Text(
+                                              r.type == AttendanceType.inScan
+                                                  ? 'In'
+                                                  : 'Out')),
+                                          const DataCell(Text('0:0')),
+                                          const DataCell(Text('0:0')),
+                                          DataCell(Text(r.remarks ?? '')),
+                                        ]),
+                                      )
+                                      .toList(),
                                 ),
-                                const SizedBox(width: 8),
-                                OutlinedButton(
-                                  onPressed: () => setState(() {}),
-                                  child: const Text('Refresh'),
-                                ),
-                              ],
-                            ),
-                          ],
+                              ),
                             ),
                           ),
                         ),
-                      ),
-                    ],
+                        const SizedBox(width: 16),
+                        // Right panel
+                        Flexible(
+                          flex: 1,
+                          child: ConstrainedBox(
+                            constraints: const BoxConstraints(maxWidth: 380),
+                            child: SingleChildScrollView(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  _buildDetailRow(
+                                      'Employee Code', employee?.code ?? ''),
+                                  _buildDetailRow(
+                                      'Employee Name', employee?.name ?? ''),
+                                  _buildDetailRow('Designation Name',
+                                      employee?.designation ?? ''),
+                                  _buildDetailRow('Branch Name', ''),
+                                  _buildDetailRow('Group Name',
+                                      employee?.displayDepartment ?? ''),
+                                  const SizedBox(height: 8),
+                                  _buildDetailRow(
+                                      'Today Check-In',
+                                      _formatMaybeTime(
+                                          context,
+                                          context
+                                              .watch<AttendanceProvider>()
+                                              .todayCheckInTime)),
+                                  _buildDetailRow(
+                                      'Today Check-Out',
+                                      _formatMaybeTime(
+                                          context,
+                                          context
+                                              .watch<AttendanceProvider>()
+                                              .todayCheckOutTime)),
+                                  const SizedBox(height: 8),
+                                  Row(
+                                    children: [
+                                      Expanded(
+                                        child: Center(
+                                          child: Text(
+                                            _lastType == AttendanceType.outScan
+                                                ? 'OUT'
+                                                : 'IN',
+                                            style: TextStyle(
+                                              color: _lastType ==
+                                                      AttendanceType.outScan
+                                                  ? Colors.red
+                                                  : Colors.green,
+                                              fontSize: 48,
+                                              fontWeight: FontWeight.bold,
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                      Container(
+                                        width: 130,
+                                        height: 130,
+                                        color: Colors.grey.shade300,
+                                        child: employee?.imageUrl != null
+                                            ? Image.network(
+                                                employee!.imageUrl!,
+                                                fit: BoxFit.cover,
+                                                errorBuilder:
+                                                    (context, error, stack) =>
+                                                        const Icon(Icons.person,
+                                                            size: 64),
+                                              )
+                                            : const Icon(Icons.person,
+                                                size: 64),
+                                      ),
+                                    ],
+                                  ),
+                                  const SizedBox(height: 8),
+                                  _buildDetailRow(
+                                      'Selected Reason', _selectedReason ?? ''),
+                                  const SizedBox(height: 16),
+                                  Text(
+                                    _formatLongDate(_now),
+                                    style:
+                                        Theme.of(context).textTheme.titleLarge,
+                                  ),
+                                  Text(
+                                    TimeOfDay.fromDateTime(_now)
+                                        .format(context),
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .headlineMedium
+                                        ?.copyWith(fontWeight: FontWeight.bold),
+                                  ),
+                                  const SizedBox(height: 12),
+                                  Row(
+                                    children: [
+                                      ElevatedButton(
+                                        onPressed: () =>
+                                            Navigator.maybePop(context),
+                                        child: const Text('Close'),
+                                      ),
+                                      const SizedBox(width: 8),
+                                      OutlinedButton(
+                                        onPressed: () => setState(() {}),
+                                        child: const Text('Refresh'),
+                                      ),
+                                    ],
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
-                ),
-                const SizedBox(height: 8),
-                // Bottom tabs (flex to available space to avoid overflow)
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      TabBar(
-                        isScrollable: true,
-                        controller: _tabController,
-                        labelColor: Theme.of(context).colorScheme.primary,
-                        tabs: const [
-                          Tab(text: 'Present Employees (0)'),
-                          Tab(text: 'Absent Employees (0)'),
-                          Tab(text: 'Out Employees (0)'),
-                        ],
-                      ),
-                      Expanded(
-                        child: TabBarView(
+                  const SizedBox(height: 8),
+                  // Bottom tabs (flex to available space to avoid overflow)
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        TabBar(
+                          isScrollable: true,
                           controller: _tabController,
-                          children: const [
-                            _EmptyGrid(),
-                            _EmptyGrid(),
-                            _EmptyGrid(),
+                          labelColor: Theme.of(context).colorScheme.primary,
+                          tabs: const [
+                            Tab(text: 'Present Employees (0)'),
+                            Tab(text: 'Absent Employees (0)'),
+                            Tab(text: 'Out Employees (0)'),
                           ],
                         ),
-                      ),
-                    ],
+                        Expanded(
+                          child: TabBarView(
+                            controller: _tabController,
+                            children: const [
+                              _EmptyGrid(),
+                              _EmptyGrid(),
+                              _EmptyGrid(),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
-          ),
-          if (isLoading) const LinearProgressIndicator(),
-        ],
+            if (isLoading || _isProcessing) const LinearProgressIndicator(),
+          ],
+        ),
       ),
-    ),
-  );
+    );
   }
 }
 
